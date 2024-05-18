@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Sat, 18 May 2024 19:28:22 +0800
+Subject: Patching kernel rockchip64 files mm/vmalloc.c
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ mm/vmalloc.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 8af231a50de2..bc8255017f11 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2621,10 +2621,11 @@ struct vm_struct *__get_vm_area_caller(unsigned long size, unsigned long flags,
+ 				       const void *caller)
+ {
+ 	return __get_vm_area_node(size, 1, PAGE_SHIFT, flags, start, end,
+ 				  NUMA_NO_NODE, GFP_KERNEL, caller);
+ }
++EXPORT_SYMBOL_GPL(__get_vm_area_caller);
+ 
+ /**
+  * get_vm_area - reserve a contiguous kernel virtual area
+  * @size:	 size of the area
+  * @flags:	 %VM_IOREMAP for I/O mappings or VM_ALLOC
+-- 
+Created with Armbian build tools https://github.com/armbian/build
+

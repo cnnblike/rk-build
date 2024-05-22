@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Tue, 21 May 2024 15:56:26 +0800
+Subject: Patching kernel rockchip64 files
+ arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts | 20 +++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts b/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts
+index 0d917658d24a..ba14ee06aa08 100644
+--- a/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts
+@@ -149,11 +149,11 @@ vcc_io: vcc-io {
+ 		regulator-min-microvolt = <3300000>;
+ 		regulator-max-microvolt = <3300000>;
+ 		vin-supply = <&vcc5v0_sys>;
+ 	};
+ 
+-  vcc_phy: vcc-phy-regulator {
++    vcc_phy: vcc-phy-regulator {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "vcc_phy";
+ 		regulator-always-on;
+ 		regulator-boot-on;
+ 	};
+@@ -166,10 +166,24 @@ vcc5v0_otg: vcc5v0-otg {
+ 		enable-active-high;
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&otg_vbus_drv>;
+ 		vin-supply = <&vcc5v0_sys>;
+ 	};
++
++	reserved-memory {
++		jailhouse: jailhouse@1f800000 {
++			reg = <0x0 0x1f800000 0x0 0x00800000>;
++			no-map;
++			status = "okay";
++		};
++
++		jh_inmate: jh_inmate@1f400000 {
++			reg = <0x0 0x1f400000 0x0 0x00400000>;
++			no-map;
++			status = "okay";
++		};
++	};
+ };
+ 
+ &acodec {
+ 	status = "okay";
+ 	#sound-dai-cells = <0>;
+@@ -298,10 +312,14 @@ &spi2 {
+ 
+ &uart0 {
+ 	status = "okay";
+ };
+ 
++&uart1 {
++	status = "okay";
++};
++
+ &uart2 {
+ 	status = "okay";
+ };
+ 
+ &uart4 {
+-- 
+Created with Armbian build tools https://github.com/armbian/build
+

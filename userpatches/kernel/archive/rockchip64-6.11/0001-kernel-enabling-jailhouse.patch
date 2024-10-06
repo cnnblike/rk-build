@@ -1,0 +1,3705 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Fri, 27 Sep 2024 16:00:10 +0000
+Subject: Generic jailhouse enabling patch for kernel 6.11.y
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ MAINTAINERS                                        |    1 +
+ arch/arm/kernel/armksyms.c                         |    5 +
+ arch/arm/kernel/hyp-stub.S                         |    3 +-
+ arch/arm64/boot/dts/marvell/armada-37xx.dtsi       |    1 +
+ arch/arm64/boot/dts/marvell/armada-8040-mcbin.dtsi |    1 +
+ arch/arm64/kernel/hyp-stub.S                       |    5 +
+ arch/x86/kernel/apic/apic.c                        |    1 +
+ drivers/net/Kconfig                                |    4 +
+ drivers/net/Makefile                               |    2 +
+ drivers/net/ivshmem-net.c                          | 1105 ++++++++++
+ drivers/uio/Kconfig                                |    7 +
+ drivers/uio/Makefile                               |    1 +
+ drivers/uio/uio.c                                  |    9 +
+ drivers/uio/uio_ivshmem.c                          |  241 ++
+ drivers/virt/Kconfig                               |   11 +
+ drivers/virt/Makefile                              |    1 +
+ drivers/virt/jailhouse_dbgcon.c                    |  103 +
+ drivers/virtio/Kconfig                             |   10 +
+ drivers/virtio/Makefile                            |    1 +
+ drivers/virtio/virtio_ivshmem.c                    |  949 ++++++++
+ include/linux/ivshmem.h                            |   30 +
+ include/linux/pci_ids.h                            |    1 +
+ include/linux/uio_driver.h                         |    2 +
+ mm/vmalloc.c                                       |    4 +-
+ tools/virtio/.gitignore                            |    2 +
+ tools/virtio/Makefile                              |    7 +-
+ tools/virtio/virtio-ivshmem-block.c                |  357 +++
+ tools/virtio/virtio-ivshmem-console.c              |  397 ++++
+ 28 files changed, 3257 insertions(+), 4 deletions(-)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index cc40a9d9b8cd..db188f534427 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -11994,10 +11994,11 @@ JAILHOUSE HYPERVISOR INTERFACE
+ M:	Jan Kiszka <jan.kiszka@siemens.com>
+ L:	jailhouse-dev@googlegroups.com
+ S:	Maintained
+ F:	arch/x86/include/asm/jailhouse_para.h
+ F:	arch/x86/kernel/jailhouse.c
++F:	drivers/virt/jailhouse_dbgcon.c
+ 
+ JFS FILESYSTEM
+ M:	Dave Kleikamp <shaggy@kernel.org>
+ L:	jfs-discussion@lists.sourceforge.net
+ S:	Odd Fixes
+diff --git a/arch/arm/kernel/armksyms.c b/arch/arm/kernel/armksyms.c
+index 82e96ac83684..354ab3e4e41f 100644
+--- a/arch/arm/kernel/armksyms.c
++++ b/arch/arm/kernel/armksyms.c
+@@ -14,10 +14,11 @@
+ #include <linux/io.h>
+ #include <linux/arm-smccc.h>
+ 
+ #include <asm/checksum.h>
+ #include <asm/ftrace.h>
++#include <asm/virt.h>
+ 
+ /*
+  * libgcc functions - functions that are used internally by the
+  * compiler...  (prototypes are not correct though, but that
+  * doesn't really matter since they're not versioned).
+@@ -173,5 +174,9 @@ EXPORT_SYMBOL(__pv_offset);
+ 
+ #ifdef CONFIG_HAVE_ARM_SMCCC
+ EXPORT_SYMBOL(__arm_smccc_smc);
+ EXPORT_SYMBOL(__arm_smccc_hvc);
+ #endif
++
++#ifdef CONFIG_ARM_VIRT_EXT
++EXPORT_SYMBOL_GPL(__boot_cpu_mode);
++#endif
+diff --git a/arch/arm/kernel/hyp-stub.S b/arch/arm/kernel/hyp-stub.S
+index 3a506b9095a5..abcbe614a39d 100644
+--- a/arch/arm/kernel/hyp-stub.S
++++ b/arch/arm/kernel/hyp-stub.S
+@@ -4,10 +4,11 @@
+  */
+ 
+ #include <linux/init.h>
+ #include <linux/irqchip/arm-gic-v3.h>
+ #include <linux/linkage.h>
++#include <linux/export.h>
+ #include <asm/assembler.h>
+ #include <asm/virt.h>
+ 
+ .arch armv7-a
+ 
+@@ -236,6 +237,6 @@ __hyp_stub_pabort:	W(b)	.
+ __hyp_stub_dabort:	W(b)	.
+ __hyp_stub_trap:	W(b)	__hyp_stub_do_trap
+ __hyp_stub_irq:		W(b)	.
+ __hyp_stub_fiq:		W(b)	.
+ ENDPROC(__hyp_stub_vectors)
+-
++EXPORT_SYMBOL_GPL(__hyp_stub_vectors)
+diff --git a/arch/arm64/boot/dts/marvell/armada-37xx.dtsi b/arch/arm64/boot/dts/marvell/armada-37xx.dtsi
+index 9603223dd761..4c2122d7484b 100644
+--- a/arch/arm64/boot/dts/marvell/armada-37xx.dtsi
++++ b/arch/arm64/boot/dts/marvell/armada-37xx.dtsi
+@@ -500,10 +500,11 @@ pcie0: pcie@d0070000 {
+ 			status = "disabled";
+ 			reg = <0 0xd0070000 0 0x20000>;
+ 			#address-cells = <3>;
+ 			#size-cells = <2>;
+ 			bus-range = <0x00 0xff>;
++			linux,pci-domain = <0>;
+ 			interrupts = <GIC_SPI 29 IRQ_TYPE_LEVEL_HIGH>;
+ 			#interrupt-cells = <1>;
+ 			clocks = <&sb_periph_clk 13>;
+ 			msi-parent = <&pcie0>;
+ 			msi-controller;
+diff --git a/arch/arm64/boot/dts/marvell/armada-8040-mcbin.dtsi b/arch/arm64/boot/dts/marvell/armada-8040-mcbin.dtsi
+index c864df9ec84d..beec8e22d5bb 100644
+--- a/arch/arm64/boot/dts/marvell/armada-8040-mcbin.dtsi
++++ b/arch/arm64/boot/dts/marvell/armada-8040-mcbin.dtsi
+@@ -175,10 +175,11 @@ ge_phy: ethernet-phy@0 {
+ 		reg = <0>;
+ 	};
+ };
+ 
+ &cp0_pcie0 {
++	linux,pci-domain = <0>;
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&cp0_pcie_pins>;
+ 	num-lanes = <4>;
+ 	num-viewport = <8>;
+ 	reset-gpios = <&cp0_gpio2 20 GPIO_ACTIVE_LOW>;
+diff --git a/arch/arm64/kernel/hyp-stub.S b/arch/arm64/kernel/hyp-stub.S
+index 65f76064c86b..7b64b207769c 100644
+--- a/arch/arm64/kernel/hyp-stub.S
++++ b/arch/arm64/kernel/hyp-stub.S
+@@ -6,10 +6,11 @@
+  * Author:	Marc Zyngier <marc.zyngier@arm.com>
+  */
+ 
+ #include <linux/init.h>
+ #include <linux/linkage.h>
++#include <linux/export.h>
+ 
+ #include <asm/assembler.h>
+ #include <asm/el2_setup.h>
+ #include <asm/kvm_arm.h>
+ #include <asm/kvm_asm.h>
+@@ -40,10 +41,11 @@ SYM_CODE_START(__hyp_stub_vectors)
+ 	ventry	el1_sync_invalid		// Synchronous 32-bit EL1
+ 	ventry	el1_irq_invalid			// IRQ 32-bit EL1
+ 	ventry	el1_fiq_invalid			// FIQ 32-bit EL1
+ 	ventry	el1_error_invalid		// Error 32-bit EL1
+ SYM_CODE_END(__hyp_stub_vectors)
++EXPORT_SYMBOL_GPL(__hyp_stub_vectors)
+ 
+ 	.align 11
+ 
+ SYM_CODE_START_LOCAL(elx_sync)
+ 	cmp	x0, #HVC_SET_VECTORS
+@@ -244,10 +246,13 @@ SYM_FUNC_END(__hyp_reset_vectors)
+ SYM_FUNC_START(finalise_el2)
+ 	// Need to have booted at EL2
+ 	cmp	w0, #BOOT_CPU_MODE_EL2
+ 	b.ne	1f
+ 
++	// disable VHE and stay in EL1 to allow Jailhouse to load
++	ret
++
+ 	// and still be at EL1
+ 	mrs	x0, CurrentEL
+ 	cmp	x0, #CurrentEL_EL1
+ 	b.ne	1f
+ 
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index 373638691cd4..c940abb99ebf 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -171,10 +171,11 @@ static struct resource lapic_resource = {
+ 	.name = "Local APIC",
+ 	.flags = IORESOURCE_MEM | IORESOURCE_BUSY,
+ };
+ 
+ unsigned int lapic_timer_period = 0;
++EXPORT_SYMBOL_GPL(lapic_timer_period);
+ 
+ static void apic_pm_activate(void);
+ 
+ /*
+  * Get the LAPIC version
+diff --git a/drivers/net/Kconfig b/drivers/net/Kconfig
+index 9920b3a68ed1..012fee5dcd66 100644
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -666,6 +666,10 @@ config NETDEV_LEGACY_INIT
+ 	depends on ISA
+ 	help
+ 	  Drivers that call netdev_boot_setup_check() should select this
+ 	  symbol, everything else no longer needs it.
+ 
++config IVSHMEM_NET
++	tristate "IVSHMEM virtual network device"
++	depends on PCI
++
+ endif # NETDEVICES
+diff --git a/drivers/net/Makefile b/drivers/net/Makefile
+index 13743d0e83b5..ce8b88a3357b 100644
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -88,5 +88,7 @@ obj-$(CONFIG_NTB_NETDEV) += ntb_netdev.o
+ 
+ obj-$(CONFIG_FUJITSU_ES) += fjes/
+ obj-$(CONFIG_USB4_NET) += thunderbolt/
+ obj-$(CONFIG_NETDEVSIM) += netdevsim/
+ obj-$(CONFIG_NET_FAILOVER) += net_failover.o
++
++obj-$(CONFIG_IVSHMEM_NET) += ivshmem-net.o
+diff --git a/drivers/net/ivshmem-net.c b/drivers/net/ivshmem-net.c
+new file mode 100644
+index 000000000000..d0293272f1ca
+--- /dev/null
++++ b/drivers/net/ivshmem-net.c
+@@ -0,0 +1,1105 @@
++/*
++ * Copyright 2016 Mans Rullgard <mans@mansr.com>
++ * Copyright (c) Siemens AG, 2016-2020
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <linux/ivshmem.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/io.h>
++#include <linux/bitops.h>
++#include <linux/ethtool.h>
++#include <linux/interrupt.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/rtnetlink.h>
++#include <linux/virtio_ring.h>
++
++#define DRV_NAME "ivshmem-net"
++
++#define IVSHM_NET_STATE_UNKNOWN		(~0)
++#define IVSHM_NET_STATE_RESET		0
++#define IVSHM_NET_STATE_INIT		1
++#define IVSHM_NET_STATE_READY		2
++#define IVSHM_NET_STATE_RUN		3
++
++#define IVSHM_NET_FLAG_RUN		0
++
++#define IVSHM_NET_MTU_DEF		16384
++
++#define IVSHM_NET_FRAME_SIZE(s) ALIGN(18 + (s), SMP_CACHE_BYTES)
++
++#define IVSHM_NET_VQ_ALIGN 64
++
++#define IVSHM_NET_SECTION_TX		0
++#define IVSHM_NET_SECTION_RX		1
++
++#define IVSHM_NET_MSIX_STATE		0
++#define IVSHM_NET_MSIX_TX_RX		1
++
++#define IVSHM_NET_NUM_VECTORS		2
++
++struct ivshm_net_queue {
++	struct vring vr;
++	u32 free_head;
++	u32 num_free;
++	u32 num_added;
++	u16 last_avail_idx;
++	u16 last_used_idx;
++
++	void *data;
++	void *end;
++	u32 size;
++	u32 head;
++	u32 tail;
++};
++
++struct ivshm_net_stats {
++	u32 tx_rx_interrupts;
++	u32 tx_packets;
++	u32 tx_notify;
++	u32 tx_pause;
++	u32 rx_packets;
++	u32 rx_notify;
++	u32 napi_poll;
++	u32 napi_complete;
++	u32 napi_poll_n[10];
++};
++
++struct ivshm_net {
++	struct ivshm_net_queue rx;
++	struct ivshm_net_queue tx;
++
++	u32 vrsize;
++	u32 qlen;
++	u32 qsize;
++
++	struct napi_struct napi;
++
++	struct mutex state_lock;
++	u32 state;
++	u32 last_peer_state;
++	u32 *state_table;
++
++	unsigned long flags;
++
++	struct workqueue_struct *state_wq;
++	struct work_struct state_work;
++
++	struct ivshm_net_stats stats;
++
++	struct ivshm_regs __iomem *ivshm_regs;
++	void *shm[2];
++	resource_size_t shmlen;
++	u32 peer_id;
++
++	u32 tx_rx_vector;
++
++	struct pci_dev *pdev;
++};
++
++static void *ivshm_net_desc_data(struct ivshm_net *in,
++				 struct ivshm_net_queue *q,
++				 unsigned int region,
++				 struct vring_desc *desc,
++				 u32 *len)
++{
++	u64 offs = READ_ONCE(desc->addr);
++	u32 dlen = READ_ONCE(desc->len);
++	u16 flags = READ_ONCE(desc->flags);
++	void *data;
++
++	if (flags)
++		return NULL;
++
++	if (offs >= in->shmlen)
++		return NULL;
++
++	data = in->shm[region] + offs;
++
++	if (data < q->data || data >= q->end)
++		return NULL;
++
++	if (dlen > q->end - data)
++		return NULL;
++
++	*len = dlen;
++
++	return data;
++}
++
++static void ivshm_net_init_queue(struct ivshm_net *in,
++				 struct ivshm_net_queue *q,
++				 void *mem, unsigned int len)
++{
++	memset(q, 0, sizeof(*q));
++
++	vring_init(&q->vr, len, mem, IVSHM_NET_VQ_ALIGN);
++	q->data = mem + in->vrsize;
++	q->end = q->data + in->qsize;
++	q->size = in->qsize;
++}
++
++static void ivshm_net_init_queues(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++	void *tx;
++	void *rx;
++	int i;
++
++	tx = in->shm[IVSHM_NET_SECTION_TX];
++	rx = in->shm[IVSHM_NET_SECTION_RX];
++
++	memset(tx, 0, in->shmlen);
++
++	ivshm_net_init_queue(in, &in->tx, tx, in->qlen);
++	ivshm_net_init_queue(in, &in->rx, rx, in->qlen);
++
++	swap(in->rx.vr.used, in->tx.vr.used);
++
++	in->tx.num_free = in->tx.vr.num;
++
++	for (i = 0; i < in->tx.vr.num - 1; i++)
++		in->tx.vr.desc[i].next = i + 1;
++}
++
++static int ivshm_net_calc_qsize(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++	unsigned int vrsize;
++	unsigned int qsize;
++	unsigned int qlen;
++
++	for (qlen = 4096; qlen > 32; qlen >>= 1) {
++		vrsize = vring_size(qlen, IVSHM_NET_VQ_ALIGN);
++		vrsize = ALIGN(vrsize, IVSHM_NET_VQ_ALIGN);
++		if (vrsize < in->shmlen / 8)
++			break;
++	}
++
++	if (vrsize > in->shmlen)
++		return -EINVAL;
++
++	qsize = in->shmlen - vrsize;
++
++	if (qsize < 4 * ETH_MIN_MTU)
++		return -EINVAL;
++
++	in->vrsize = vrsize;
++	in->qlen = qlen;
++	in->qsize = qsize;
++
++	return 0;
++}
++
++static void ivshm_net_notify_tx(struct ivshm_net *in, unsigned int num)
++{
++	u16 evt, old, new;
++
++	virt_mb();
++
++	evt = READ_ONCE(vring_avail_event(&in->tx.vr));
++	old = in->tx.last_avail_idx - num;
++	new = in->tx.last_avail_idx;
++
++	if (vring_need_event(evt, new, old)) {
++		writel(in->tx_rx_vector | (in->peer_id << 16),
++		       &in->ivshm_regs->doorbell);
++		in->stats.tx_notify++;
++	}
++}
++
++static void ivshm_net_enable_rx_irq(struct ivshm_net *in)
++{
++	vring_avail_event(&in->rx.vr) = in->rx.last_avail_idx;
++	virt_wmb();
++}
++
++static void ivshm_net_notify_rx(struct ivshm_net *in, unsigned int num)
++{
++	u16 evt, old, new;
++
++	virt_mb();
++
++	evt = READ_ONCE(vring_used_event(&in->rx.vr));
++	old = in->rx.last_used_idx - num;
++	new = in->rx.last_used_idx;
++
++	if (vring_need_event(evt, new, old)) {
++		writel(in->tx_rx_vector | (in->peer_id << 16),
++		       &in->ivshm_regs->doorbell);
++		in->stats.rx_notify++;
++	}
++}
++
++static void ivshm_net_enable_tx_irq(struct ivshm_net *in)
++{
++	vring_used_event(&in->tx.vr) = in->tx.last_used_idx;
++	virt_wmb();
++}
++
++static bool ivshm_net_rx_avail(struct ivshm_net *in)
++{
++	virt_mb();
++	return READ_ONCE(in->rx.vr.avail->idx) != in->rx.last_avail_idx;
++}
++
++static size_t ivshm_net_tx_space(struct ivshm_net *in)
++{
++	struct ivshm_net_queue *tx = &in->tx;
++	u32 tail = tx->tail;
++	u32 head = tx->head;
++	u32 space;
++
++	if (head < tail)
++		space = tail - head;
++	else
++		space = max(tx->size - head, tail);
++
++	return space;
++}
++
++static bool ivshm_net_tx_ok(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++
++	return in->tx.num_free >= 2 &&
++		ivshm_net_tx_space(in) >= 2 * IVSHM_NET_FRAME_SIZE(ndev->mtu);
++}
++
++static u32 ivshm_net_tx_advance(struct ivshm_net_queue *q, u32 *pos, u32 len)
++{
++	u32 p = *pos;
++
++	len = IVSHM_NET_FRAME_SIZE(len);
++
++	if (q->size - p < len)
++		p = 0;
++	*pos = p + len;
++
++	return p;
++}
++
++static bool ivshm_net_tx_clean(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++	struct ivshm_net_queue *tx = &in->tx;
++	struct vring_used_elem *used;
++	struct vring *vr = &tx->vr;
++	struct vring_desc *desc;
++	struct vring_desc *fdesc;
++	u16 last = tx->last_used_idx;
++	unsigned int num;
++	bool tx_ok;
++	u32 fhead;
++
++	fdesc = NULL;
++	fhead = 0;
++	num = 0;
++
++	while (last != virt_load_acquire(&vr->used->idx)) {
++		void *data;
++		u32 len;
++		u32 tail;
++
++		used = vr->used->ring + (last % vr->num);
++		if (used->id >= vr->num || used->len != 1) {
++			netdev_err(ndev, "invalid tx used->id %d ->len %d\n",
++				   used->id, used->len);
++			break;
++		}
++
++		desc = &vr->desc[used->id];
++
++		data = ivshm_net_desc_data(in, &in->tx, IVSHM_NET_SECTION_TX,
++					   desc, &len);
++		if (!data) {
++			netdev_err(ndev, "bad tx descriptor, data == NULL\n");
++			break;
++		}
++
++		tail = ivshm_net_tx_advance(tx, &tx->tail, len);
++		if (data != tx->data + tail) {
++			netdev_err(ndev, "bad tx descriptor\n");
++			break;
++		}
++
++		if (!num)
++			fdesc = desc;
++		else
++			desc->next = fhead;
++
++		fhead = used->id;
++
++		tx->last_used_idx = ++last;
++		num++;
++		tx->num_free++;
++		BUG_ON(tx->num_free > vr->num);
++
++		tx_ok = ivshm_net_tx_ok(ndev);
++		if (!tx_ok)
++			ivshm_net_enable_tx_irq(in);
++	}
++
++	if (num) {
++		fdesc->next = tx->free_head;
++		tx->free_head = fhead;
++	} else {
++		tx_ok = ivshm_net_tx_ok(ndev);
++	}
++
++	return tx_ok;
++}
++
++static void ivshm_net_tx_poll(struct net_device *ndev)
++{
++	struct netdev_queue *txq = netdev_get_tx_queue(ndev, 0);
++
++	if (!__netif_tx_trylock(txq))
++		return;
++
++	if (ivshm_net_tx_clean(ndev) && netif_queue_stopped(ndev))
++		netif_wake_queue(ndev);
++
++	__netif_tx_unlock(txq);
++}
++
++static struct vring_desc *ivshm_net_rx_desc(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++	struct ivshm_net_queue *rx = &in->rx;
++	struct vring *vr = &rx->vr;
++	unsigned int avail;
++	u16 avail_idx;
++
++	avail_idx = virt_load_acquire(&vr->avail->idx);
++
++	if (avail_idx == rx->last_avail_idx)
++		return NULL;
++
++	avail = vr->avail->ring[rx->last_avail_idx++ & (vr->num - 1)];
++	if (avail >= vr->num) {
++		netdev_err(ndev, "invalid rx avail %d\n", avail);
++		return NULL;
++	}
++
++	return &vr->desc[avail];
++}
++
++static void ivshm_net_rx_finish(struct ivshm_net *in, struct vring_desc *desc)
++{
++	struct ivshm_net_queue *rx = &in->rx;
++	struct vring *vr = &rx->vr;
++	unsigned int desc_id = desc - vr->desc;
++	unsigned int used;
++
++	used = rx->last_used_idx++ & (vr->num - 1);
++	vr->used->ring[used].id = desc_id;
++	vr->used->ring[used].len = 1;
++
++	virt_store_release(&vr->used->idx, rx->last_used_idx);
++}
++
++static int ivshm_net_poll(struct napi_struct *napi, int budget)
++{
++	struct net_device *ndev = napi->dev;
++	struct ivshm_net *in = container_of(napi, struct ivshm_net, napi);
++	int received = 0;
++
++	in->stats.napi_poll++;
++
++	ivshm_net_tx_poll(ndev);
++
++	while (received < budget) {
++		struct vring_desc *desc;
++		struct sk_buff *skb;
++		void *data;
++		u32 len;
++
++		desc = ivshm_net_rx_desc(ndev);
++		if (!desc)
++			break;
++
++		data = ivshm_net_desc_data(in, &in->rx, IVSHM_NET_SECTION_RX,
++					   desc, &len);
++		if (!data) {
++			netdev_err(ndev, "bad rx descriptor\n");
++			break;
++		}
++
++		skb = napi_alloc_skb(napi, len);
++
++		if (skb) {
++			memcpy(skb_put(skb, len), data, len);
++			skb->protocol = eth_type_trans(skb, ndev);
++			napi_gro_receive(napi, skb);
++		}
++
++		ndev->stats.rx_packets++;
++		ndev->stats.rx_bytes += len;
++
++		ivshm_net_rx_finish(in, desc);
++		received++;
++	}
++
++	if (received < budget) {
++		in->stats.napi_complete++;
++		napi_complete_done(napi, received);
++		ivshm_net_enable_rx_irq(in);
++		if (ivshm_net_rx_avail(in))
++			napi_schedule(napi);
++	}
++
++	if (received)
++		ivshm_net_notify_rx(in, received);
++
++	in->stats.rx_packets += received;
++	in->stats.napi_poll_n[received ? 1 + min(ilog2(received), 8) : 0]++;
++
++	return received;
++}
++
++static netdev_tx_t ivshm_net_xmit(struct sk_buff *skb, struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++	struct ivshm_net_queue *tx = &in->tx;
++	bool xmit_more = netdev_xmit_more();
++	struct vring *vr = &tx->vr;
++	struct vring_desc *desc;
++	unsigned int desc_idx;
++	unsigned int avail;
++	u32 head;
++	void *buf;
++
++	if (!ivshm_net_tx_clean(ndev)) {
++		netif_stop_queue(ndev);
++
++		netdev_err(ndev, "BUG: tx ring full when queue awake!\n");
++		return NETDEV_TX_BUSY;
++	}
++
++	desc_idx = tx->free_head;
++	desc = &vr->desc[desc_idx];
++	tx->free_head = desc->next;
++	tx->num_free--;
++
++	head = ivshm_net_tx_advance(tx, &tx->head, skb->len);
++
++	if (!ivshm_net_tx_ok(ndev)) {
++		ivshm_net_enable_tx_irq(in);
++		netif_stop_queue(ndev);
++		xmit_more = false;
++		in->stats.tx_pause++;
++	}
++
++	buf = tx->data + head;
++	skb_copy_and_csum_dev(skb, buf);
++
++	desc->addr = buf - in->shm[IVSHM_NET_SECTION_TX];
++	desc->len = skb->len;
++	desc->flags = 0;
++
++	avail = tx->last_avail_idx++ & (vr->num - 1);
++	vr->avail->ring[avail] = desc_idx;
++	tx->num_added++;
++
++	virt_store_release(&vr->avail->idx, tx->last_avail_idx);
++
++	if (!xmit_more) {
++		ivshm_net_notify_tx(in, tx->num_added);
++		tx->num_added = 0;
++	}
++
++	in->stats.tx_packets++;
++	ndev->stats.tx_packets++;
++	ndev->stats.tx_bytes += skb->len;
++
++	dev_consume_skb_any(skb);
++
++	return NETDEV_TX_OK;
++}
++
++static void ivshm_net_set_state(struct ivshm_net *in, u32 state)
++{
++	virt_wmb();
++	WRITE_ONCE(in->state, state);
++	writel(state, &in->ivshm_regs->state);
++}
++
++static void ivshm_net_run(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++
++	if (in->state < IVSHM_NET_STATE_READY)
++		return;
++
++	if (!netif_running(ndev))
++		return;
++
++	if (in->last_peer_state == IVSHM_NET_STATE_RUN)
++		netif_carrier_on(ndev);
++
++	if (test_and_set_bit(IVSHM_NET_FLAG_RUN, &in->flags))
++		return;
++
++	netif_start_queue(ndev);
++	napi_enable(&in->napi);
++	local_bh_disable();
++	napi_schedule(&in->napi);
++	local_bh_enable();
++	ivshm_net_set_state(in, IVSHM_NET_STATE_RUN);
++}
++
++static void ivshm_net_do_stop(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++
++	ivshm_net_set_state(in, IVSHM_NET_STATE_RESET);
++
++	if (!test_and_clear_bit(IVSHM_NET_FLAG_RUN, &in->flags))
++		return;
++
++	netif_carrier_off(ndev);
++	netif_stop_queue(ndev);
++	napi_disable(&in->napi);
++}
++
++static void ivshm_net_state_change(struct work_struct *work)
++{
++	struct ivshm_net *in = container_of(work, struct ivshm_net, state_work);
++	struct net_device *ndev = in->napi.dev;
++	u32 peer_state = READ_ONCE(in->state_table[in->peer_id]);
++
++	mutex_lock(&in->state_lock);
++
++	if (peer_state == in->last_peer_state) {
++		mutex_unlock(&in->state_lock);
++		return;
++	}
++
++	in->last_peer_state = peer_state;
++
++	switch (in->state) {
++	case IVSHM_NET_STATE_RESET:
++		/*
++		 * Wait for the remote to leave READY/RUN before transitioning
++		 * to INIT.
++		 */
++		if (peer_state < IVSHM_NET_STATE_READY)
++			ivshm_net_set_state(in, IVSHM_NET_STATE_INIT);
++		break;
++
++	case IVSHM_NET_STATE_INIT:
++		/*
++		 * Wait for the remote to leave RESET before performing the
++		 * initialization and moving to READY.
++		 */
++		if (peer_state > IVSHM_NET_STATE_RESET) {
++			ivshm_net_init_queues(ndev);
++			ivshm_net_set_state(in, IVSHM_NET_STATE_READY);
++
++			mutex_unlock(&in->state_lock);
++
++			rtnl_lock();
++			call_netdevice_notifiers(NETDEV_CHANGEADDR, ndev);
++			rtnl_unlock();
++
++			return;
++		}
++		break;
++
++	case IVSHM_NET_STATE_READY:
++	case IVSHM_NET_STATE_RUN:
++		if (peer_state >= IVSHM_NET_STATE_READY) {
++			/*
++			 * Link is up and we are running once the remote is in
++			 * READY or RUN.
++			 */
++			ivshm_net_run(ndev);
++		} else if (peer_state == IVSHM_NET_STATE_RESET) {
++			/*
++			 * If the remote goes to RESET, we need to follow
++			 * immediately.
++			 */
++			ivshm_net_do_stop(ndev);
++		}
++		break;
++	}
++
++	mutex_unlock(&in->state_lock);
++}
++
++static void ivshm_net_check_state(struct ivshm_net *in)
++{
++	queue_work(in->state_wq, &in->state_work);
++}
++
++static irqreturn_t ivshm_net_int_state(int irq, void *data)
++{
++	struct ivshm_net *in = data;
++
++	ivshm_net_check_state(in);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t ivshm_net_int_tx_rx(int irq, void *data)
++{
++	struct ivshm_net *in = data;
++
++	in->stats.tx_rx_interrupts++;
++
++	napi_schedule_irqoff(&in->napi);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t ivshm_net_intx(int irq, void *data)
++{
++	ivshm_net_int_state(irq, data);
++	ivshm_net_int_tx_rx(irq, data);
++
++	return IRQ_HANDLED;
++}
++
++static int ivshm_net_open(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++
++	netdev_reset_queue(ndev);
++	ndev->operstate = IF_OPER_UP;
++
++	mutex_lock(&in->state_lock);
++	ivshm_net_run(ndev);
++	mutex_unlock(&in->state_lock);
++
++	return 0;
++}
++
++static int ivshm_net_stop(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++
++	ndev->operstate = IF_OPER_DOWN;
++
++	mutex_lock(&in->state_lock);
++	ivshm_net_do_stop(ndev);
++	mutex_unlock(&in->state_lock);
++
++	return 0;
++}
++
++static int ivshm_net_change_mtu(struct net_device *ndev, int mtu)
++{
++	if (netif_running(ndev)) {
++		netdev_err(ndev, "must be stopped to change its MTU\n");
++		return -EBUSY;
++	}
++
++	ndev->mtu = mtu;
++
++	return 0;
++}
++
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void ivshm_net_poll_controller(struct net_device *ndev)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++
++	napi_schedule(&in->napi);
++}
++#endif
++
++static const struct net_device_ops ivshm_net_ops = {
++	.ndo_open		= ivshm_net_open,
++	.ndo_stop		= ivshm_net_stop,
++	.ndo_start_xmit		= ivshm_net_xmit,
++	.ndo_change_mtu		= ivshm_net_change_mtu,
++	.ndo_set_mac_address 	= eth_mac_addr,
++	.ndo_validate_addr	= eth_validate_addr,
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	.ndo_poll_controller	= ivshm_net_poll_controller,
++#endif
++};
++
++static const char ivshm_net_stats[][ETH_GSTRING_LEN] = {
++	"tx_rx_interrupts",
++	"tx_packets",
++	"tx_notify",
++	"tx_pause",
++	"rx_packets",
++	"rx_notify",
++	"napi_poll",
++	"napi_complete",
++	"napi_poll_0",
++	"napi_poll_1",
++	"napi_poll_2",
++	"napi_poll_4",
++	"napi_poll_8",
++	"napi_poll_16",
++	"napi_poll_32",
++	"napi_poll_64",
++	"napi_poll_128",
++	"napi_poll_256",
++};
++
++#define NUM_STATS ARRAY_SIZE(ivshm_net_stats)
++
++static int ivshm_net_get_sset_count(struct net_device *ndev, int sset)
++{
++	if (sset == ETH_SS_STATS)
++		return NUM_STATS;
++
++	return -EOPNOTSUPP;
++}
++
++static void ivshm_net_get_strings(struct net_device *ndev, u32 sset, u8 *buf)
++{
++	if (sset == ETH_SS_STATS)
++		memcpy(buf, &ivshm_net_stats, sizeof(ivshm_net_stats));
++}
++
++static void ivshm_net_get_ethtool_stats(struct net_device *ndev,
++					struct ethtool_stats *estats, u64 *st)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++	unsigned int n = 0;
++	unsigned int i;
++
++	st[n++] = in->stats.tx_rx_interrupts;
++	st[n++] = in->stats.tx_packets;
++	st[n++] = in->stats.tx_notify;
++	st[n++] = in->stats.tx_pause;
++	st[n++] = in->stats.rx_packets;
++	st[n++] = in->stats.rx_notify;
++	st[n++] = in->stats.napi_poll;
++	st[n++] = in->stats.napi_complete;
++
++	for (i = 0; i < ARRAY_SIZE(in->stats.napi_poll_n); i++)
++		st[n++] = in->stats.napi_poll_n[i];
++
++	memset(&in->stats, 0, sizeof(in->stats));
++}
++
++#define IVSHM_NET_REGS_LEN	(3 * sizeof(u32) + 6 * sizeof(u16))
++
++static int ivshm_net_get_regs_len(struct net_device *ndev)
++{
++	return IVSHM_NET_REGS_LEN;
++}
++
++static void ivshm_net_get_regs(struct net_device *ndev,
++			       struct ethtool_regs *regs, void *p)
++{
++	struct ivshm_net *in = netdev_priv(ndev);
++	u32 *reg32 = p;
++	u16 *reg16;
++
++	*reg32++ = in->state;
++	*reg32++ = in->last_peer_state;
++	*reg32++ = in->qlen;
++
++	reg16 = (u16 *)reg32;
++
++	*reg16++ = in->tx.vr.avail ? in->tx.vr.avail->idx : 0;
++	*reg16++ = in->tx.vr.used ? in->tx.vr.used->idx : 0;
++	*reg16++ = in->tx.vr.avail ? vring_avail_event(&in->tx.vr) : 0;
++
++	*reg16++ = in->rx.vr.avail ? in->rx.vr.avail->idx : 0;
++	*reg16++ = in->rx.vr.used ? in->rx.vr.used->idx : 0;
++	*reg16++ = in->rx.vr.avail ? vring_avail_event(&in->rx.vr) : 0;
++}
++
++static const struct ethtool_ops ivshm_net_ethtool_ops = {
++	.get_sset_count		= ivshm_net_get_sset_count,
++	.get_strings		= ivshm_net_get_strings,
++	.get_ethtool_stats	= ivshm_net_get_ethtool_stats,
++	.get_regs_len		= ivshm_net_get_regs_len,
++	.get_regs		= ivshm_net_get_regs,
++};
++
++static u64 get_config_qword(struct pci_dev *pdev, unsigned int pos)
++{
++	u32 lo, hi;
++
++	pci_read_config_dword(pdev, pos, &lo);
++	pci_read_config_dword(pdev, pos + 4, &hi);
++	return lo | ((u64)hi << 32);
++}
++
++static int ivshm_net_probe(struct pci_dev *pdev,
++			   const struct pci_device_id *pci_id)
++{
++	phys_addr_t output_sections_addr, section_addr;
++	resource_size_t section_sz, output_section_sz;
++	void *state_table, *output_sections;
++	struct ivshm_regs __iomem *regs;
++	struct net_device *ndev;
++	struct ivshm_net *in;
++	unsigned int cap_pos;
++	char *device_name;
++	int vendor_cap;
++	u32 id, dword;
++	int ret;
++
++	ret = pcim_enable_device(pdev);
++	if (ret) {
++		dev_err(&pdev->dev, "pci_enable_device: %d\n", ret);
++		return ret;
++	}
++
++	ret = pcim_iomap_regions(pdev, BIT(0), DRV_NAME);
++	if (ret) {
++		dev_err(&pdev->dev, "pcim_iomap_regions: %d\n", ret);
++		return ret;
++	}
++
++	regs = pcim_iomap_table(pdev)[0];
++
++	id = readl(&regs->id);
++	if (id > 1) {
++		dev_err(&pdev->dev, "invalid ID %d\n", id);
++		return -EINVAL;
++	}
++	if (readl(&regs->max_peers) > 2) {
++		dev_err(&pdev->dev, "only 2 peers supported\n");
++		return -EINVAL;
++	}
++
++	vendor_cap = pci_find_capability(pdev, PCI_CAP_ID_VNDR);
++	if (vendor_cap < 0) {
++		dev_err(&pdev->dev, "missing vendor capability\n");
++		return -EINVAL;
++	}
++
++	if (pci_resource_len(pdev, 2) > 0) {
++		section_addr = pci_resource_start(pdev, 2);
++	} else {
++		cap_pos = vendor_cap + IVSHM_CFG_ADDRESS;
++		section_addr = get_config_qword(pdev, cap_pos);
++	}
++
++	cap_pos = vendor_cap + IVSHM_CFG_STATE_TAB_SZ;
++	pci_read_config_dword(pdev, cap_pos, &dword);
++	section_sz = dword;
++
++	if (!devm_request_mem_region(&pdev->dev, section_addr, section_sz,
++				     DRV_NAME))
++		return -EBUSY;
++
++	state_table = devm_memremap(&pdev->dev, section_addr, section_sz,
++				    MEMREMAP_WB);
++	if (!state_table)
++		return -ENOMEM;
++
++	output_sections_addr = section_addr + section_sz;
++
++	cap_pos = vendor_cap + IVSHM_CFG_RW_SECTION_SZ;
++	section_sz = get_config_qword(pdev, cap_pos);
++	if (section_sz > 0) {
++		dev_info(&pdev->dev, "R/W section detected - "
++			 "unused by this driver version\n");
++		output_sections_addr += section_sz;
++	}
++
++	cap_pos = vendor_cap + IVSHM_CFG_OUTPUT_SECTION_SZ;
++	output_section_sz = get_config_qword(pdev, cap_pos);
++	if (output_section_sz == 0) {
++		dev_err(&pdev->dev, "Missing input/output sections\n");
++		return -EINVAL;
++	}
++
++	if (!devm_request_mem_region(&pdev->dev, output_sections_addr,
++				     output_section_sz * 2, DRV_NAME))
++		return -EBUSY;
++
++	output_sections = devm_memremap(&pdev->dev, output_sections_addr,
++					output_section_sz * 2, MEMREMAP_WB);
++	if (!output_sections)
++		return -ENOMEM;
++
++	section_addr = output_sections_addr + output_section_sz * id;
++	dev_info(&pdev->dev, "TX memory at %pa, size %pa\n",
++		 &section_addr, &output_section_sz);
++	section_addr = output_sections_addr + output_section_sz * !id;
++	dev_info(&pdev->dev, "RX memory at %pa, size %pa\n",
++		 &section_addr, &output_section_sz);
++
++	device_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "%s[%s]", DRV_NAME,
++				     dev_name(&pdev->dev));
++	if (!device_name)
++		return -ENOMEM;
++
++	ndev = alloc_etherdev(sizeof(*in));
++	if (!ndev)
++		return -ENOMEM;
++
++	pci_set_drvdata(pdev, ndev);
++	SET_NETDEV_DEV(ndev, &pdev->dev);
++
++	in = netdev_priv(ndev);
++	in->ivshm_regs = regs;
++	in->state_table = state_table;
++
++	in->shm[IVSHM_NET_SECTION_TX] =
++		output_sections + output_section_sz * id;
++	in->shm[IVSHM_NET_SECTION_RX] =
++		output_sections + output_section_sz * !id;
++
++	in->shmlen = output_section_sz;
++
++	in->peer_id = !id;
++	in->pdev = pdev;
++	in->last_peer_state = IVSHM_NET_STATE_UNKNOWN;
++
++	mutex_init(&in->state_lock);
++
++	ret = ivshm_net_calc_qsize(ndev);
++	if (ret)
++		goto err_free;
++
++	in->state_wq = alloc_ordered_workqueue(device_name, 0);
++	if (!in->state_wq)
++		goto err_free;
++
++	INIT_WORK(&in->state_work, ivshm_net_state_change);
++
++	eth_hw_addr_random(ndev);
++	ndev->netdev_ops = &ivshm_net_ops;
++	ndev->ethtool_ops = &ivshm_net_ethtool_ops;
++	ndev->mtu = min_t(u32, IVSHM_NET_MTU_DEF, in->qsize / 16);
++	ndev->min_mtu = ETH_MIN_MTU;
++	ndev->max_mtu = min_t(u32, ETH_MAX_MTU, in->qsize / 4);
++	ndev->hw_features = NETIF_F_HW_CSUM | NETIF_F_SG;
++	ndev->features = ndev->hw_features;
++
++	netif_carrier_off(ndev);
++	netif_napi_add(ndev, &in->napi, ivshm_net_poll);
++
++	ret = register_netdev(ndev);
++	if (ret)
++		goto err_wq;
++
++	ret = pci_alloc_irq_vectors(pdev, 1, 2, PCI_IRQ_INTX | PCI_IRQ_MSIX);
++	if (ret < 0)
++		goto err_alloc_irq;
++
++	if (pdev->msix_enabled) {
++		if (ret != 2) {
++			ret = -EBUSY;
++			goto err_request_irq;
++		}
++
++		device_name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
++					     "%s-state[%s]", DRV_NAME,
++					     dev_name(&pdev->dev));
++		if (!device_name) {
++			ret = -ENOMEM;
++			goto err_request_irq;
++		}
++
++		ret = request_irq(pci_irq_vector(pdev, IVSHM_NET_MSIX_STATE),
++				  ivshm_net_int_state, 0, device_name, in);
++		if (ret)
++			goto err_request_irq;
++
++		device_name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
++					     "%s-tx-rx[%s]", DRV_NAME,
++					     dev_name(&pdev->dev));
++		if (!device_name) {
++			ret = -ENOMEM;
++			goto err_request_irq2;
++		}
++
++		ret = request_irq(pci_irq_vector(pdev, IVSHM_NET_MSIX_TX_RX),
++				  ivshm_net_int_tx_rx, 0, device_name, in);
++		if (ret)
++			goto err_request_irq2;
++
++		in->tx_rx_vector = IVSHM_NET_MSIX_TX_RX;
++	} else {
++		ret = request_irq(pci_irq_vector(pdev, 0), ivshm_net_intx, 0,
++				  device_name, in);
++		if (ret)
++			goto err_request_irq;
++
++		in->tx_rx_vector = 0;
++	}
++
++	pci_set_master(pdev);
++
++	pci_write_config_byte(pdev, vendor_cap + IVSHM_CFG_PRIV_CNTL, 0);
++	writel(IVSHM_INT_ENABLE, &in->ivshm_regs->int_control);
++
++	writel(IVSHM_NET_STATE_RESET, &in->ivshm_regs->state);
++	ivshm_net_check_state(in);
++
++	return 0;
++
++err_request_irq2:
++	free_irq(pci_irq_vector(pdev, IVSHM_NET_MSIX_STATE), in);
++err_request_irq:
++	pci_free_irq_vectors(pdev);
++err_alloc_irq:
++	unregister_netdev(ndev);
++err_wq:
++	destroy_workqueue(in->state_wq);
++err_free:
++	free_netdev(ndev);
++
++	return ret;
++}
++
++static void ivshm_net_remove(struct pci_dev *pdev)
++{
++	struct net_device *ndev = pci_get_drvdata(pdev);
++	struct ivshm_net *in = netdev_priv(ndev);
++
++	writel(IVSHM_NET_STATE_RESET, &in->ivshm_regs->state);
++	writel(0, &in->ivshm_regs->int_control);
++
++	if (pdev->msix_enabled) {
++		free_irq(pci_irq_vector(pdev, IVSHM_NET_MSIX_STATE), in);
++		free_irq(pci_irq_vector(pdev, IVSHM_NET_MSIX_TX_RX), in);
++	} else {
++		free_irq(pci_irq_vector(pdev, 0), in);
++	}
++	pci_free_irq_vectors(pdev);
++
++	unregister_netdev(ndev);
++	cancel_work_sync(&in->state_work);
++	destroy_workqueue(in->state_wq);
++	free_netdev(ndev);
++}
++
++static const struct pci_device_id ivshm_net_id_table[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_SIEMENS, PCI_DEVICE_ID_IVSHMEM),
++	  (PCI_CLASS_OTHERS << 16) | IVSHM_PROTO_NET, 0xffffff },
++	{ 0 }
++};
++MODULE_DEVICE_TABLE(pci, ivshm_net_id_table);
++
++static struct pci_driver ivshm_net_driver = {
++	.name		= DRV_NAME,
++	.id_table	= ivshm_net_id_table,
++	.probe		= ivshm_net_probe,
++	.remove		= ivshm_net_remove,
++};
++module_pci_driver(ivshm_net_driver);
++
++MODULE_AUTHOR("Mans Rullgard <mans@mansr.com>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/uio/Kconfig b/drivers/uio/Kconfig
+index b060dcd7c635..d7c271e69608 100644
+--- a/drivers/uio/Kconfig
++++ b/drivers/uio/Kconfig
+@@ -162,6 +162,13 @@ config UIO_DFL
+ 	  It could be found at:
+ 
+ 	    opae-sdk/tools/libopaeuio/
+ 
+ 	  If you compile this as a module, it will be called uio_dfl.
++
++config UIO_IVSHMEM
++	tristate "Inter-VM Shared Memory driver"
++	depends on PCI
++	help
++	  Userspace I/O driver for the inter-VM shared memory PCI device
++	  as provided by QEMU and the Jailhouse hypervisor.
+ endif
+diff --git a/drivers/uio/Makefile b/drivers/uio/Makefile
+index 1c5f3b5a95cf..d584799c2131 100644
+--- a/drivers/uio/Makefile
++++ b/drivers/uio/Makefile
+@@ -9,5 +9,6 @@ obj-$(CONFIG_UIO_PCI_GENERIC)	+= uio_pci_generic.o
+ obj-$(CONFIG_UIO_NETX)	+= uio_netx.o
+ obj-$(CONFIG_UIO_MF624)         += uio_mf624.o
+ obj-$(CONFIG_UIO_FSL_ELBC_GPCM)	+= uio_fsl_elbc_gpcm.o
+ obj-$(CONFIG_UIO_HV_GENERIC)	+= uio_hv_generic.o
+ obj-$(CONFIG_UIO_DFL)	+= uio_dfl.o
++obj-$(CONFIG_UIO_IVSHMEM)	+= uio_ivshmem.o
+diff --git a/drivers/uio/uio.c b/drivers/uio/uio.c
+index 20d2a55cb40b..6817e8ab5802 100644
+--- a/drivers/uio/uio.c
++++ b/drivers/uio/uio.c
+@@ -848,10 +848,19 @@ static int uio_mmap(struct file *filep, struct vm_area_struct *vma)
+ 	if (requested_pages > actual_pages) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
++	if (idev->info->mem[mi].readonly) {
++		if (vma->vm_flags & VM_WRITE) {
++			ret = -EINVAL;
++			goto out;
++		}
++
++		vm_flags_clear(vma, VM_MAYWRITE);
++	}
++
+ 	if (idev->info->mmap) {
+ 		ret = idev->info->mmap(idev->info, vma);
+ 		goto out;
+ 	}
+ 
+diff --git a/drivers/uio/uio_ivshmem.c b/drivers/uio/uio_ivshmem.c
+new file mode 100644
+index 000000000000..b7b6a7767781
+--- /dev/null
++++ b/drivers/uio/uio_ivshmem.c
+@@ -0,0 +1,241 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * UIO driver for Inter-VM shared memory PCI device
++ *
++ * Copyright (c) Siemens AG, 2019
++ *
++ * Authors:
++ *  Jan Kiszka <jan.kiszka@siemens.com>
++ */
++
++#include <linux/ivshmem.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/uio_driver.h>
++
++#define DRV_NAME "uio_ivshmem"
++
++struct ivshm_dev {
++	struct uio_info info;
++	struct pci_dev *pdev;
++	struct ivshm_regs __iomem *regs;
++	int vectors;
++};
++
++static irqreturn_t ivshm_irq_handler(int irq, void *dev_id)
++{
++	struct ivshm_dev *ivshm_dev = (struct ivshm_dev *)dev_id;
++
++	/* nothing else to do, we configured one-shot interrupt mode */
++	uio_event_notify(&ivshm_dev->info);
++
++	return IRQ_HANDLED;
++}
++
++static u64 get_config_qword(struct pci_dev *pdev, unsigned int pos)
++{
++	u32 lo, hi;
++
++	pci_read_config_dword(pdev, pos, &lo);
++	pci_read_config_dword(pdev, pos + 4, &hi);
++	return lo | ((u64)hi << 32);
++}
++
++static int ivshm_release(struct uio_info *info, struct inode *inode)
++{
++	struct ivshm_dev *ivshm_dev =
++		container_of(info, struct ivshm_dev, info);
++
++	writel(0, &ivshm_dev->regs->state);
++	return 0;
++}
++
++static int ivshm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	resource_size_t rw_section_sz, output_section_sz;
++	struct ivshm_dev *ivshm_dev;
++	phys_addr_t section_addr;
++	int err, vendor_cap, i;
++	unsigned int cap_pos;
++	struct uio_mem *mem;
++	char *device_name;
++	u32 dword;
++
++	ivshm_dev = devm_kzalloc(&pdev->dev, sizeof(struct ivshm_dev),
++				 GFP_KERNEL);
++	if (!ivshm_dev)
++		return -ENOMEM;
++
++	err = pcim_enable_device(pdev);
++	if (err)
++		return err;
++
++	device_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "%s[%s]", DRV_NAME,
++				     dev_name(&pdev->dev));
++	if (!device_name)
++		return -ENOMEM;
++
++	ivshm_dev->info.name = device_name;
++	ivshm_dev->info.version = "1";
++	ivshm_dev->info.release = ivshm_release;
++
++	err = pcim_iomap_regions(pdev, BIT(0), device_name);
++	if (err)
++		return err;
++	ivshm_dev->regs = pcim_iomap_table(pdev)[0];
++
++	mem = &ivshm_dev->info.mem[0];
++
++	mem->name = "registers";
++	mem->addr = pci_resource_start(pdev, 0);
++	if (!mem->addr)
++		return -ENODEV;
++	mem->size = pci_resource_len(pdev, 0);
++	mem->memtype = UIO_MEM_PHYS;
++
++	vendor_cap = pci_find_capability(pdev, PCI_CAP_ID_VNDR);
++	if (vendor_cap < 0)
++		return -ENODEV;
++
++	if (pci_resource_len(pdev, 2) > 0) {
++		section_addr = pci_resource_start(pdev, 2);
++	} else {
++		cap_pos = vendor_cap + IVSHM_CFG_ADDRESS;
++		section_addr = get_config_qword(pdev, cap_pos);
++	}
++
++	mem++;
++	mem->name = "state_table";
++	mem->addr = section_addr;
++	cap_pos = vendor_cap + IVSHM_CFG_STATE_TAB_SZ;
++	pci_read_config_dword(pdev, cap_pos, &dword);
++	mem->size = dword;
++	mem->memtype = UIO_MEM_IOVA;
++	mem->readonly = true;
++	if (!devm_request_mem_region(&pdev->dev, mem->addr, mem->size,
++				     device_name))
++		return -EBUSY;
++	dev_info(&pdev->dev, "%s at %pa, size %pa\n", mem->name, &mem->addr,
++		 &mem->size);
++
++	cap_pos = vendor_cap + IVSHM_CFG_RW_SECTION_SZ;
++	rw_section_sz = get_config_qword(pdev, cap_pos);
++	if (rw_section_sz > 0) {
++		section_addr += mem->size;
++
++		mem++;
++		mem->name = "rw_section";
++		mem->addr = section_addr;
++		mem->size = rw_section_sz;
++		mem->memtype = UIO_MEM_IOVA;
++		if (!devm_request_mem_region(&pdev->dev, mem->addr, mem->size,
++					     device_name))
++			return -EBUSY;
++		dev_info(&pdev->dev, "%s at %pa, size %pa\n", mem->name,
++			 &mem->addr, &mem->size);
++	}
++
++	cap_pos = vendor_cap + IVSHM_CFG_OUTPUT_SECTION_SZ;
++	output_section_sz = get_config_qword(pdev, cap_pos);
++	if (output_section_sz > 0) {
++		section_addr += mem->size;
++
++		mem++;
++		mem->name = "input_sections";
++		mem->addr = section_addr;
++		mem->size =
++			readl(&ivshm_dev->regs->max_peers) * output_section_sz;
++		mem->memtype = UIO_MEM_IOVA;
++		mem->readonly = true;
++		if (!devm_request_mem_region(&pdev->dev, mem->addr, mem->size,
++					     device_name))
++			return -EBUSY;
++		dev_info(&pdev->dev, "%s at %pa, size %pa\n", mem->name,
++			 &mem->addr, &mem->size);
++
++		mem++;
++		mem->name = "output_section";
++		mem->addr = section_addr +
++			readl(&ivshm_dev->regs->id) * output_section_sz;
++		mem->size = output_section_sz;
++		mem->memtype = UIO_MEM_IOVA;
++		dev_info(&pdev->dev, "%s at %pa, size %pa\n", mem->name,
++			 &mem->addr, &mem->size);
++	}
++
++	pci_write_config_byte(pdev, vendor_cap + IVSHM_CFG_PRIV_CNTL,
++			      IVSHM_PRIV_CNTL_ONESHOT_INT);
++
++	/*
++	 * Grab all vectors although we can only coalesce them into a single
++	 * notifier. This avoids missing any event.
++	 */
++	ivshm_dev->vectors = pci_msix_vec_count(pdev);
++	if (ivshm_dev->vectors < 0)
++		ivshm_dev->vectors = 1;
++
++	err = pci_alloc_irq_vectors(pdev, ivshm_dev->vectors,
++				    ivshm_dev->vectors,
++				    PCI_IRQ_INTX | PCI_IRQ_MSIX);
++	if (err < 0)
++		return err;
++
++	for (i = 0; i < ivshm_dev->vectors; i++) {
++		err = request_irq(pci_irq_vector(pdev, i), ivshm_irq_handler,
++				  IRQF_SHARED, ivshm_dev->info.name, ivshm_dev);
++		if (err)
++			goto error;
++	}
++
++	ivshm_dev->info.irq = UIO_IRQ_CUSTOM;
++
++	err = uio_register_device(&pdev->dev, &ivshm_dev->info);
++	if (err)
++		goto error;
++
++	pci_set_master(pdev);
++
++	pci_set_drvdata(pdev, ivshm_dev);
++
++	return 0;
++
++error:
++	while (--i > 0)
++		free_irq(pci_irq_vector(pdev, i), ivshm_dev);
++	pci_free_irq_vectors(pdev);
++	return err;
++}
++
++static void ivshm_remove(struct pci_dev *pdev)
++{
++	struct ivshm_dev *ivshm_dev = pci_get_drvdata(pdev);
++	int i;
++
++	writel(0, &ivshm_dev->regs->int_control);
++	pci_clear_master(pdev);
++
++	uio_unregister_device(&ivshm_dev->info);
++
++	for (i = 0; i < ivshm_dev->vectors; i++)
++		free_irq(pci_irq_vector(pdev, i), ivshm_dev);
++
++	pci_free_irq_vectors(pdev);
++}
++
++static const struct pci_device_id ivshm_device_id_table[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_SIEMENS, PCI_DEVICE_ID_IVSHMEM),
++	  (PCI_CLASS_OTHERS << 16) | IVSHM_PROTO_UNDEFINED, 0xffffff },
++	{ 0 }
++};
++MODULE_DEVICE_TABLE(pci, ivshm_device_id_table);
++
++static struct pci_driver uio_ivshm_driver = {
++	.name = DRV_NAME,
++	.id_table = ivshm_device_id_table,
++	.probe = ivshm_probe,
++	.remove = ivshm_remove,
++};
++module_pci_driver(uio_ivshm_driver);
++
++MODULE_AUTHOR("Jan Kiszka <jan.kiszka@siemens.com>");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/virt/Kconfig b/drivers/virt/Kconfig
+index d8c848cf09a6..3daaedabbcb1 100644
+--- a/drivers/virt/Kconfig
++++ b/drivers/virt/Kconfig
+@@ -39,10 +39,21 @@ config FSL_HV_MANAGER
+ 	     receiving the shutdown doorbell from a manager partition.
+ 
+           4) A kernel interface for receiving callbacks when a managed
+ 	     partition shuts down.
+ 
++config JAILHOUSE_DBGCON
++	tristate "Jailhouse console driver"
++	depends on X86 || ARM || ARM64
++	help
++	  The Jailhouse hypervisor provides a simple write-only console for
++	  debugging the bootstrap process of its cells. This driver registers
++	  a console with the kernel to make use of it.
++
++	  Note that Jailhouse has to be configured to permit a cell the usage
++	  of the console interface.
++
+ source "drivers/virt/vboxguest/Kconfig"
+ 
+ source "drivers/virt/nitro_enclaves/Kconfig"
+ 
+ source "drivers/virt/acrn/Kconfig"
+diff --git a/drivers/virt/Makefile b/drivers/virt/Makefile
+index f29901bd7820..f54287001da1 100644
+--- a/drivers/virt/Makefile
++++ b/drivers/virt/Makefile
+@@ -3,10 +3,11 @@
+ # Makefile for drivers that support virtualization
+ #
+ 
+ obj-$(CONFIG_FSL_HV_MANAGER)	+= fsl_hypervisor.o
+ obj-$(CONFIG_VMGENID)		+= vmgenid.o
++obj-$(CONFIG_JAILHOUSE_DBGCON)	+= jailhouse_dbgcon.o
+ obj-y				+= vboxguest/
+ 
+ obj-$(CONFIG_NITRO_ENCLAVES)	+= nitro_enclaves/
+ obj-$(CONFIG_ACRN_HSM)		+= acrn/
+ obj-y				+= coco/
+diff --git a/drivers/virt/jailhouse_dbgcon.c b/drivers/virt/jailhouse_dbgcon.c
+new file mode 100644
+index 000000000000..1fd201ea1460
+--- /dev/null
++++ b/drivers/virt/jailhouse_dbgcon.c
+@@ -0,0 +1,103 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Console driver for running over the Jailhouse partitioning hypervisor
++ *
++ * Copyright (c) Siemens AG, 2016-2018
++ *
++ * Authors:
++ *  Jan Kiszka <jan.kiszka@siemens.com>
++ */
++
++#include <linux/console.h>
++#include <linux/hypervisor.h>
++#include <linux/module.h>
++#include <linux/serial_core.h>
++#ifdef CONFIG_X86
++#include <asm/alternative.h>
++#endif
++#ifdef CONFIG_ARM
++#include <asm/opcodes-virt.h>
++#endif
++
++#define JAILHOUSE_HC_DEBUG_CONSOLE_PUTC		8
++
++static void hypervisor_putc(char c)
++{
++#if defined(CONFIG_X86)
++	int result;
++
++	asm volatile(
++		ALTERNATIVE(".byte 0x0f,0x01,0xc1", ".byte 0x0f,0x01,0xd9",
++			    X86_FEATURE_VMMCALL)
++		: "=a" (result)
++		: "a" (JAILHOUSE_HC_DEBUG_CONSOLE_PUTC), "D" (c)
++		: "memory");
++#elif defined(CONFIG_ARM)
++	register u32 num_res asm("r0") = JAILHOUSE_HC_DEBUG_CONSOLE_PUTC;
++	register u32 arg1 asm("r1") = c;
++
++	asm volatile(
++		__HVC(0x4a48)
++		: "=r" (num_res)
++		: "r" (num_res), "r" (arg1)
++		: "memory");
++#elif defined(CONFIG_ARM64)
++	register u64 num_res asm("x0") = JAILHOUSE_HC_DEBUG_CONSOLE_PUTC;
++	register u64 arg1 asm("x1") = c;
++
++	asm volatile(
++		"hvc #0x4a48\n\t"
++		: "=r" (num_res)
++		: "r" (num_res), "r" (arg1)
++		: "memory");
++#else
++#error Unsupported architecture.
++#endif
++}
++
++static void jailhouse_dbgcon_write(struct console *con, const char *s,
++				   unsigned count)
++{
++	while (count > 0) {
++		hypervisor_putc(*s);
++		count--;
++		s++;
++	}
++}
++
++static int __init early_jailhouse_dbgcon_setup(struct earlycon_device *device,
++					       const char *options)
++{
++	device->con->write = jailhouse_dbgcon_write;
++	return 0;
++}
++
++EARLYCON_DECLARE(jailhouse, early_jailhouse_dbgcon_setup);
++
++static struct console jailhouse_dbgcon = {
++	.name = "jailhouse",
++	.write = jailhouse_dbgcon_write,
++	.flags = CON_PRINTBUFFER | CON_ANYTIME,
++	.index = -1,
++};
++
++static int __init jailhouse_dbgcon_init(void)
++{
++	if (!jailhouse_paravirt())
++		return -ENODEV;
++
++	register_console(&jailhouse_dbgcon);
++	return 0;
++}
++
++static void __exit jailhouse_dbgcon_exit(void)
++{
++	unregister_console(&jailhouse_dbgcon);
++}
++
++module_init(jailhouse_dbgcon_init);
++module_exit(jailhouse_dbgcon_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Jailhouse debug console driver");
++MODULE_AUTHOR("Jan Kiszka <jan.kiszka@siemens.com>");
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index 42a48ac763ee..11df52059f6a 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -186,6 +186,16 @@ config VIRTIO_DEBUG
+ 	  This allows to debug features, to see what features the device
+ 	  advertises and to set filter for features used by driver.
+ 
+ 	  If unsure, say N.
+ 
++config VIRTIO_IVSHMEM
++	tristate "Driver for ivshmem-based virtio front-end devices"
++	depends on PCI && !HIGHMEM
++	select VIRTIO
++	help
++	  This provides virtio front-end devices via ivshmem shared memory
++	  devices.
++
++	  If unsure, say 'N'.
++
+ endif # VIRTIO_MENU
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index 58b2b0489fc9..f09649f5c771 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -6,10 +6,11 @@ obj-$(CONFIG_VIRTIO_PCI_LIB_LEGACY) += virtio_pci_legacy_dev.o
+ obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
+ obj-$(CONFIG_VIRTIO_PCI) += virtio_pci.o
+ virtio_pci-y := virtio_pci_modern.o virtio_pci_common.o
+ virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
+ virtio_pci-$(CONFIG_VIRTIO_PCI_ADMIN_LEGACY) += virtio_pci_admin_legacy_io.o
++obj-$(CONFIG_VIRTIO_IVSHMEM) += virtio_ivshmem.o
+ obj-$(CONFIG_VIRTIO_BALLOON) += virtio_balloon.o
+ obj-$(CONFIG_VIRTIO_INPUT) += virtio_input.o
+ obj-$(CONFIG_VIRTIO_VDPA) += virtio_vdpa.o
+ obj-$(CONFIG_VIRTIO_MEM) += virtio_mem.o
+ obj-$(CONFIG_VIRTIO_DMA_SHARED_BUFFER) += virtio_dma_buf.o
+diff --git a/drivers/virtio/virtio_ivshmem.c b/drivers/virtio/virtio_ivshmem.c
+new file mode 100644
+index 000000000000..1fa08906fe81
+--- /dev/null
++++ b/drivers/virtio/virtio_ivshmem.c
+@@ -0,0 +1,949 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio over ivshmem front-end device driver
++ *
++ * Copyright (c) Siemens AG, 2019
++ */
++
++#include <linux/delay.h>
++#include <linux/dma-map-ops.h>
++#include <linux/ivshmem.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pci.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ring.h>
++
++#define DRV_NAME "virtio-ivshmem"
++
++#define VIRTIO_IVSHMEM_PREFERRED_ALLOC_CHUNKS	4096
++
++#define VIRTIO_STATE_READY	cpu_to_le32(1)
++
++struct virtio_ivshmem_header {
++	__le32 revision;
++	__le32 size;
++
++	__le32 write_transaction;
++
++	__le32 device_features;
++	__le32 device_features_sel;
++	__le32 driver_features;
++	__le32 driver_features_sel;
++
++	__le32 queue_sel;
++
++	__le16 queue_size;
++	__le16 queue_device_vector;
++	__le16 queue_driver_vector;
++	__le16 queue_enable;
++	__le64 queue_desc;
++	__le64 queue_driver;
++	__le64 queue_device;
++
++	__u8 config_event;
++	__u8 queue_event;
++	__u8 __reserved[2];
++	__le32 device_status;
++
++	__le32 config_generation;
++	__u8 config[];
++};
++
++#define VI_REG_OFFSET(reg)	offsetof(struct virtio_ivshmem_header, reg)
++
++struct virtio_ivshmem_device {
++	struct virtio_device vdev;
++	struct pci_dev *pci_dev;
++
++	struct ivshm_regs __iomem *ivshm_regs;
++
++	unsigned int num_vectors;
++	bool per_vq_vector;
++	char *config_irq_name;
++	char *queues_irq_name;
++
++	u32 peer_id;
++	u32 *peer_state;
++
++	void *shmem;
++	resource_size_t shmem_sz;
++	struct virtio_ivshmem_header *virtio_header;
++
++	spinlock_t alloc_lock;
++	unsigned long *alloc_bitmap;
++	unsigned int alloc_shift;
++	void **map_src_addr;
++
++	/* a list of queues so we can dispatch IRQs */
++	spinlock_t virtqueues_lock;
++	struct list_head virtqueues;
++};
++
++struct virtio_ivshmem_vq_info {
++	/* the actual virtqueue */
++	struct virtqueue *vq;
++
++	/* vector to use for signaling the device */
++	unsigned int device_vector;
++	/* vector used by the device for signaling the driver */
++	unsigned int driver_vector;
++
++	char *irq_name;
++
++	/* the list node for the virtqueues list */
++	struct list_head node;
++};
++
++static inline unsigned int get_custom_order(unsigned long size,
++					    unsigned int shift)
++{
++	size--;
++	size >>= shift;
++#if BITS_PER_LONG == 32
++	return fls(size);
++#else
++	return fls64(size);
++#endif
++}
++
++static inline struct virtio_ivshmem_device *
++to_virtio_ivshmem_device(struct virtio_device *vdev)
++{
++	return container_of(vdev, struct virtio_ivshmem_device, vdev);
++}
++
++static bool vi_synchronize_reg_write(struct virtio_ivshmem_device *vi_dev)
++{
++	while (READ_ONCE(vi_dev->virtio_header->write_transaction)) {
++		if (READ_ONCE(*vi_dev->peer_state) != VIRTIO_STATE_READY) {
++			dev_err_ratelimited(&vi_dev->pci_dev->dev,
++					    "backend failed!");
++			return false;
++		}
++		cpu_relax();
++	}
++	return true;
++}
++
++static bool vi_reg_write(struct virtio_ivshmem_device *vi_dev, unsigned int reg,
++			 u64 value, unsigned int size)
++{
++	u8 *reg_area = (u8 *)vi_dev->virtio_header;
++
++	if (!vi_synchronize_reg_write(vi_dev))
++		return false;
++
++	if (size == 1)
++		*(u8 *)(reg_area + reg) = (u8)value;
++	else if (size == 2)
++		*(u16 *)(reg_area + reg) = cpu_to_le16((u16)value);
++	else if (size == 4)
++		*(u32 *)(reg_area + reg) = cpu_to_le32((u32)value);
++	else if (size == 8)
++		*(u64 *)(reg_area + reg) = cpu_to_le64(value);
++	else
++		BUG();
++	virt_wmb();
++
++	vi_dev->virtio_header->write_transaction = cpu_to_le32(reg);
++	virt_wmb();
++
++	writel((vi_dev->peer_id << 16), &vi_dev->ivshm_regs->doorbell);
++
++	return true;
++}
++
++static bool vi_reg_write16(struct virtio_ivshmem_device *vi_dev,
++			   unsigned int reg, u32 value)
++{
++	return vi_reg_write(vi_dev, reg, value, 2);
++}
++
++static bool vi_reg_write32(struct virtio_ivshmem_device *vi_dev,
++			   unsigned int reg, u32 value)
++{
++	return vi_reg_write(vi_dev, reg, value, 4);
++}
++
++static bool vi_reg_write64(struct virtio_ivshmem_device *vi_dev,
++			   unsigned int reg, u64 value)
++{
++	return vi_reg_write(vi_dev, reg, value, 8);
++}
++
++static void vi_get(struct virtio_device *vdev, unsigned offset,
++		   void *buf, unsigned len)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++	__le16 w;
++	__le32 l;
++	__le64 q;
++
++	switch (len) {
++	case 1:
++		*(u8 *)buf = *(u8 *)(vi_dev->virtio_header->config + offset);
++		break;
++	case 2:
++		w = *(u16 *)(vi_dev->virtio_header->config + offset);
++		*(u16 *)buf = le16_to_cpu(w);
++		break;
++	case 4:
++		l = *(u32 *)(vi_dev->virtio_header->config + offset);
++		*(u32 *)buf = le32_to_cpu(l);
++		break;
++	case 8:
++		q = *(u64 *)(vi_dev->virtio_header->config + offset);
++		*(u64 *)buf = le64_to_cpu(q);
++		break;
++	default:
++		BUG();
++	}
++}
++
++static void vi_set(struct virtio_device *vdev, unsigned offset,
++		   const void *buf, unsigned len)
++{
++	u64 value;
++
++	switch (len) {
++	case 1:
++		value = *(u8 *)buf;
++		break;
++	case 2:
++		value = *(u16 *)buf;
++		break;
++	case 4:
++		value = *(u32 *)buf;
++		break;
++	case 8:
++		value = *(u64 *)buf;
++		break;
++	default:
++		BUG();
++	}
++	vi_reg_write(to_virtio_ivshmem_device(vdev),
++		     offsetof(struct virtio_ivshmem_header, config) + offset,
++		     value, len);
++}
++
++static u32 vi_generation(struct virtio_device *vdev)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++	u32 gen  = READ_ONCE(vi_dev->virtio_header->config_generation);
++
++	while (gen & 1) {
++		if (READ_ONCE(*vi_dev->peer_state) != VIRTIO_STATE_READY) {
++			dev_err_ratelimited(&vi_dev->pci_dev->dev,
++					    "backend failed!");
++			return 0;
++		}
++		cpu_relax();
++
++		gen = READ_ONCE(vi_dev->virtio_header->config_generation);
++	}
++	return gen;
++}
++
++static u8 vi_get_status(struct virtio_device *vdev)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++
++	return le32_to_cpu(vi_dev->virtio_header->device_status) & 0xff;
++}
++
++static void vi_set_status(struct virtio_device *vdev, u8 status)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++
++	/* We should never be setting status to 0. */
++	BUG_ON(status == 0);
++
++	vi_reg_write32(vi_dev, VI_REG_OFFSET(device_status), status);
++}
++
++static void vi_reset(struct virtio_device *vdev)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++
++	/* 0 status means a reset. */
++	vi_reg_write32(vi_dev, VI_REG_OFFSET(device_status), 0);
++}
++
++static u64 vi_get_features(struct virtio_device *vdev)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++	u64 features;
++
++	if (!vi_reg_write32(vi_dev, VI_REG_OFFSET(device_features_sel), 1) ||
++	    !vi_synchronize_reg_write(vi_dev))
++		return 0;
++	features = le32_to_cpu(vi_dev->virtio_header->device_features);
++	features <<= 32;
++
++	if (!vi_reg_write32(vi_dev, VI_REG_OFFSET(device_features_sel), 0) ||
++	    !vi_synchronize_reg_write(vi_dev))
++		return 0;
++	features |= le32_to_cpu(vi_dev->virtio_header->device_features);
++
++	return features;
++}
++
++static int vi_finalize_features(struct virtio_device *vdev)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++
++	/* Give virtio_ring a chance to accept features. */
++	vring_transport_features(vdev);
++
++	if (!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
++		dev_err(&vdev->dev,
++			"virtio: device does not have VIRTIO_F_VERSION_1\n");
++		return -EINVAL;
++	}
++
++	if (!vi_reg_write32(vi_dev, VI_REG_OFFSET(driver_features_sel), 1) ||
++	    !vi_reg_write32(vi_dev, VI_REG_OFFSET(driver_features),
++			    (u32)(vdev->features >> 32)))
++		return -ENODEV;
++
++	if (!vi_reg_write32(vi_dev, VI_REG_OFFSET(driver_features_sel), 0) ||
++	    !vi_reg_write32(vi_dev, VI_REG_OFFSET(driver_features),
++			    (u32)vdev->features))
++		return -ENODEV;
++
++	return 0;
++}
++
++/* the notify function used when creating a virt queue */
++static bool vi_notify(struct virtqueue *vq)
++{
++	struct virtio_ivshmem_vq_info *info = vq->priv;
++	struct virtio_ivshmem_device *vi_dev =
++		to_virtio_ivshmem_device(vq->vdev);
++
++	virt_wmb();
++	writel((vi_dev->peer_id << 16) | info->device_vector,
++	       &vi_dev->ivshm_regs->doorbell);
++
++	return true;
++}
++
++static irqreturn_t vi_config_interrupt(int irq, void *opaque)
++{
++	struct virtio_ivshmem_device *vi_dev = opaque;
++
++	if (unlikely(READ_ONCE(*vi_dev->peer_state) != VIRTIO_STATE_READY)) {
++		virtio_break_device(&vi_dev->vdev);
++		vi_dev->virtio_header->config_event = 0;
++		vi_dev->virtio_header->queue_event = 0;
++		dev_err(&vi_dev->pci_dev->dev, "backend failed!");
++		return IRQ_HANDLED;
++	}
++
++	if (unlikely(READ_ONCE(vi_dev->virtio_header->config_event) & 1)) {
++		vi_dev->virtio_header->config_event = 0;
++		virt_wmb();
++		virtio_config_changed(&vi_dev->vdev);
++		return IRQ_HANDLED;
++	}
++
++	return IRQ_NONE;
++}
++
++static irqreturn_t vi_queues_interrupt(int irq, void *opaque)
++{
++	struct virtio_ivshmem_device *vi_dev = opaque;
++	struct virtio_ivshmem_vq_info *info;
++	irqreturn_t ret = IRQ_NONE;
++
++	if (likely(READ_ONCE(vi_dev->virtio_header->queue_event) & 1)) {
++		vi_dev->virtio_header->queue_event = 0;
++		virt_wmb();
++		spin_lock(&vi_dev->virtqueues_lock);
++		list_for_each_entry(info, &vi_dev->virtqueues, node)
++			ret |= vring_interrupt(irq, info->vq);
++		spin_unlock(&vi_dev->virtqueues_lock);
++	}
++
++	return ret;
++}
++
++static irqreturn_t vi_interrupt(int irq, void *opaque)
++{
++	return vi_config_interrupt(irq, opaque) |
++		vi_queues_interrupt(irq, opaque);
++}
++
++static struct virtqueue *vi_setup_vq(struct virtio_device *vdev,
++				     unsigned int index,
++				     void (*callback)(struct virtqueue *vq),
++				     const char *name, bool ctx,
++				     unsigned int irq_vector)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++	struct virtio_ivshmem_vq_info *info;
++	struct virtqueue *vq;
++	unsigned long flags;
++	unsigned int size;
++	int irq, err;
++
++	/* Select the queue we're interested in */
++	if (!vi_reg_write32(vi_dev, VI_REG_OFFSET(queue_sel), index) ||
++	    !vi_synchronize_reg_write(vi_dev))
++		return ERR_PTR(-ENODEV);
++
++	/* Queue shouldn't already be set up. */
++	if (vi_dev->virtio_header->queue_enable)
++		return ERR_PTR(-ENOENT);
++
++	/* Allocate and fill out our active queue description */
++	info = kzalloc(sizeof(*info), GFP_KERNEL);
++	if (!info)
++		return ERR_PTR(-ENOMEM);
++
++	size = vi_dev->virtio_header->queue_size;
++	if (size == 0) {
++		err = -ENOENT;
++		goto error_new_virtqueue;
++	}
++
++	info->device_vector = vi_dev->virtio_header->queue_device_vector;
++	info->driver_vector = irq_vector;
++
++	/* Create the vring */
++	vq = vring_create_virtqueue(index, size, SMP_CACHE_BYTES, vdev, true,
++				    true, ctx, vi_notify, callback, name);
++	if (!vq) {
++		err = -ENOMEM;
++		goto error_new_virtqueue;
++	}
++
++	if (callback && vi_dev->per_vq_vector) {
++		irq = pci_irq_vector(vi_dev->pci_dev, info->driver_vector);
++		info->irq_name = kasprintf(GFP_KERNEL, "%s-%s",
++					   dev_name(&vdev->dev), name);
++		if (!info->irq_name) {
++			err = -ENOMEM;
++			goto error_setup_virtqueue;
++		}
++
++		err = request_irq(irq, vring_interrupt, 0, info->irq_name, vq);
++		if (err)
++			goto error_setup_virtqueue;
++	}
++
++	/* Activate the queue */
++	if (!vi_reg_write16(vi_dev, VI_REG_OFFSET(queue_size),
++			    virtqueue_get_vring_size(vq)) ||
++	    !vi_reg_write16(vi_dev, VI_REG_OFFSET(queue_driver_vector),
++			    info->driver_vector) ||
++	    !vi_reg_write64(vi_dev, VI_REG_OFFSET(queue_desc),
++			    virtqueue_get_desc_addr(vq)) ||
++	    !vi_reg_write64(vi_dev, VI_REG_OFFSET(queue_driver),
++			    virtqueue_get_avail_addr(vq)) ||
++	    !vi_reg_write64(vi_dev, VI_REG_OFFSET(queue_device),
++			    virtqueue_get_used_addr(vq)) ||
++	    !vi_reg_write16(vi_dev, VI_REG_OFFSET(queue_enable), 1)) {
++		err = -ENODEV;
++		goto error_setup_virtqueue;
++	}
++
++	vq->priv = info;
++	info->vq = vq;
++
++	spin_lock_irqsave(&vi_dev->virtqueues_lock, flags);
++	list_add(&info->node, &vi_dev->virtqueues);
++	spin_unlock_irqrestore(&vi_dev->virtqueues_lock, flags);
++
++	return vq;
++
++error_setup_virtqueue:
++	vring_del_virtqueue(vq);
++
++error_new_virtqueue:
++	vi_reg_write32(vi_dev, VI_REG_OFFSET(queue_enable), 0);
++	kfree(info);
++	return ERR_PTR(err);
++}
++
++static void vi_del_vq(struct virtqueue *vq)
++{
++	struct virtio_ivshmem_device *vi_dev =
++		to_virtio_ivshmem_device(vq->vdev);
++	struct virtio_ivshmem_vq_info *info = vq->priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&vi_dev->virtqueues_lock, flags);
++	list_del(&info->node);
++	spin_unlock_irqrestore(&vi_dev->virtqueues_lock, flags);
++
++	/* Select and deactivate the queue */
++	vi_reg_write32(vi_dev, VI_REG_OFFSET(queue_sel), vq->index);
++	vi_reg_write32(vi_dev, VI_REG_OFFSET(queue_enable), 0);
++
++	vring_del_virtqueue(vq);
++
++	if (info->driver_vector) {
++		free_irq(pci_irq_vector(vi_dev->pci_dev, info->driver_vector),
++			 vq);
++		kfree(info->irq_name);
++	}
++
++	kfree(info);
++}
++
++static void vi_del_vqs(struct virtio_device *vdev)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++	struct virtqueue *vq, *n;
++
++	list_for_each_entry_safe(vq, n, &vdev->vqs, list)
++		vi_del_vq(vq);
++
++	free_irq(pci_irq_vector(vi_dev->pci_dev, 0), vi_dev);
++	if (!vi_dev->per_vq_vector && vi_dev->num_vectors > 1)
++		free_irq(pci_irq_vector(vi_dev->pci_dev, 1), vi_dev);
++	pci_free_irq_vectors(vi_dev->pci_dev);
++
++	kfree(vi_dev->config_irq_name);
++	vi_dev->config_irq_name = NULL;
++	kfree(vi_dev->queues_irq_name);
++	vi_dev->queues_irq_name = NULL;
++}
++
++static int vi_find_vqs(struct virtio_device *vdev, unsigned nvqs,
++		       struct virtqueue *vqs[],
++		       vq_callback_t *callbacks[],
++		       const char * const names[],
++		       const bool *ctx,
++		       struct irq_affinity *desc)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++	unsigned int vq_vector, desired_vectors;
++	int err, vectors, i, queue_idx = 0;
++
++	desired_vectors = 1; /* one for config events */
++	for (i = 0; i < nvqs; i++)
++		if (callbacks[i])
++			desired_vectors++;
++
++	vectors = pci_alloc_irq_vectors(vi_dev->pci_dev, desired_vectors,
++					desired_vectors, PCI_IRQ_MSIX);
++	if (vectors != desired_vectors) {
++		vectors = pci_alloc_irq_vectors(vi_dev->pci_dev, 1, 2,
++						PCI_IRQ_INTX | PCI_IRQ_MSIX);
++		if (vectors < 0)
++			return vectors;
++	}
++
++	vi_dev->num_vectors = vectors;
++	vi_dev->per_vq_vector = vectors == desired_vectors;
++
++	if (vectors == 1) {
++		vq_vector = 0;
++		err = request_irq(pci_irq_vector(vi_dev->pci_dev, 0),
++				  vi_interrupt, IRQF_SHARED,
++				  dev_name(&vdev->dev), vi_dev);
++		if (err)
++			goto error_common_irq;
++	} else {
++		vq_vector = 1;
++		vi_dev->config_irq_name = kasprintf(GFP_KERNEL, "%s-config",
++						    dev_name(&vdev->dev));
++		if (!vi_dev->config_irq_name) {
++			err = -ENOMEM;
++			goto error_common_irq;
++		}
++
++		err = request_irq(pci_irq_vector(vi_dev->pci_dev, 0),
++				  vi_config_interrupt, 0,
++				  vi_dev->config_irq_name, vi_dev);
++		if (err)
++			goto error_common_irq;
++	}
++
++	if (!vi_dev->per_vq_vector && vectors > 1) {
++		vi_dev->queues_irq_name = kasprintf(GFP_KERNEL, "%s-virtqueues",
++						    dev_name(&vdev->dev));
++		if (!vi_dev->queues_irq_name) {
++			err = -ENOMEM;
++			goto error_queues_irq;
++		}
++
++		err = request_irq(pci_irq_vector(vi_dev->pci_dev, 1),
++				  vi_queues_interrupt, 0,
++				  vi_dev->queues_irq_name, vi_dev);
++		if (err)
++			goto error_queues_irq;
++	}
++
++	for (i = 0; i < nvqs; ++i) {
++		if (!names[i]) {
++			vqs[i] = NULL;
++			continue;
++		}
++
++		vqs[i] = vi_setup_vq(vdev, queue_idx++, callbacks[i], names[i],
++				     ctx ? ctx[i] : false, vq_vector);
++		if (IS_ERR(vqs[i])) {
++			vi_del_vqs(vdev);
++			return PTR_ERR(vqs[i]);
++		}
++
++		if (vi_dev->per_vq_vector)
++			vq_vector++;
++	}
++
++	writel(IVSHM_INT_ENABLE, &vi_dev->ivshm_regs->int_control);
++
++	return 0;
++
++error_queues_irq:
++	free_irq(pci_irq_vector(vi_dev->pci_dev, 0), vi_dev);
++	kfree(vi_dev->config_irq_name);
++	vi_dev->config_irq_name = NULL;
++
++error_common_irq:
++	kfree(vi_dev->queues_irq_name);
++	vi_dev->queues_irq_name = NULL;
++	pci_free_irq_vectors(vi_dev->pci_dev);
++	return err;
++}
++
++static const char *vi_bus_name(struct virtio_device *vdev)
++{
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++
++	return pci_name(vi_dev->pci_dev);
++}
++
++static const struct virtio_config_ops virtio_ivshmem_config_ops = {
++	.get			= vi_get,
++	.set			= vi_set,
++	.generation		= vi_generation,
++	.get_status		= vi_get_status,
++	.set_status		= vi_set_status,
++	.reset			= vi_reset,
++	.find_vqs		= vi_find_vqs,
++	.del_vqs		= vi_del_vqs,
++	.get_features		= vi_get_features,
++	.finalize_features	= vi_finalize_features,
++	.bus_name		= vi_bus_name,
++};
++
++static void virtio_ivshmem_release_dev(struct device *_d)
++{
++	struct virtio_device *vdev = dev_to_virtio(_d);
++	struct virtio_ivshmem_device *vi_dev = to_virtio_ivshmem_device(vdev);
++
++	devm_kfree(&vi_dev->pci_dev->dev, vi_dev);
++}
++
++static u64 get_config_qword(struct pci_dev *pci_dev, unsigned int pos)
++{
++	u32 lo, hi;
++
++	pci_read_config_dword(pci_dev, pos, &lo);
++	pci_read_config_dword(pci_dev, pos + 4, &hi);
++	return lo | ((u64)hi << 32);
++}
++
++static void *vi_dma_alloc(struct device *dev, size_t size,
++			  dma_addr_t *dma_handle, gfp_t flag,
++			  unsigned long attrs)
++{
++	struct pci_dev *pci_dev = to_pci_dev(dev);
++	struct virtio_ivshmem_device *vi_dev = pci_get_drvdata(pci_dev);
++	int order = get_custom_order(size, vi_dev->alloc_shift);
++	int chunk = -ENOMEM;
++	unsigned long flags;
++	void *addr;
++
++	spin_lock_irqsave(&vi_dev->alloc_lock, flags);
++	chunk = bitmap_find_free_region(vi_dev->alloc_bitmap,
++					vi_dev->shmem_sz >> vi_dev->alloc_shift,
++					order);
++	spin_unlock_irqrestore(&vi_dev->alloc_lock, flags);
++
++	if (chunk < 0) {
++		if (!(attrs & DMA_ATTR_NO_WARN) && printk_ratelimit())
++			dev_warn(dev,
++				 "shared memory is full (size: %zd bytes)\n",
++				 size);
++		return NULL;
++	}
++
++	*dma_handle = chunk << vi_dev->alloc_shift;
++	addr = vi_dev->shmem + *dma_handle;
++	memset(addr, 0, size);
++
++	return addr;
++}
++
++static void vi_dma_free(struct device *dev, size_t size, void *vaddr,
++			dma_addr_t dma_handle, unsigned long attrs)
++{
++	struct pci_dev *pci_dev = to_pci_dev(dev);
++	struct virtio_ivshmem_device *vi_dev = pci_get_drvdata(pci_dev);
++	int order = get_custom_order(size, vi_dev->alloc_shift);
++	int chunk = (int)(dma_handle >> vi_dev->alloc_shift);
++	unsigned long flags;
++
++	spin_lock_irqsave(&vi_dev->alloc_lock, flags);
++	bitmap_release_region(vi_dev->alloc_bitmap, chunk, order);
++	spin_unlock_irqrestore(&vi_dev->alloc_lock, flags);
++}
++
++static dma_addr_t vi_dma_map_page(struct device *dev, struct page *page,
++				  unsigned long offset, size_t size,
++				  enum dma_data_direction dir,
++				  unsigned long attrs)
++{
++	struct pci_dev *pci_dev = to_pci_dev(dev);
++	struct virtio_ivshmem_device *vi_dev = pci_get_drvdata(pci_dev);
++	void *buffer, *orig_addr;
++	dma_addr_t dma_addr;
++
++	buffer = vi_dma_alloc(dev, size, &dma_addr, 0, attrs);
++	if (!buffer)
++		return DMA_MAPPING_ERROR;
++
++	orig_addr = page_address(page) + offset;
++	vi_dev->map_src_addr[dma_addr >> vi_dev->alloc_shift] = orig_addr;
++
++	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++	    (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL))
++		memcpy(buffer, orig_addr, size);
++
++	return dma_addr;
++}
++
++static void vi_dma_unmap_page(struct device *dev, dma_addr_t dma_addr,
++			      size_t size, enum dma_data_direction dir,
++			      unsigned long attrs)
++{
++	struct pci_dev *pci_dev = to_pci_dev(dev);
++	struct virtio_ivshmem_device *vi_dev = pci_get_drvdata(pci_dev);
++	void *orig_addr = vi_dev->map_src_addr[dma_addr >> vi_dev->alloc_shift];
++	void *buffer = vi_dev->shmem + dma_addr;
++
++	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++            ((dir == DMA_FROM_DEVICE) || (dir == DMA_BIDIRECTIONAL)))
++		memcpy(orig_addr, buffer, size);
++
++	vi_dma_free(dev, size, buffer, dma_addr, attrs);
++}
++
++static void
++vi_dma_sync_single_for_cpu(struct device *dev, dma_addr_t dma_addr,
++			   size_t size, enum dma_data_direction dir)
++{
++	struct pci_dev *pci_dev = to_pci_dev(dev);
++	struct virtio_ivshmem_device *vi_dev = pci_get_drvdata(pci_dev);
++	void *orig_addr = vi_dev->map_src_addr[dma_addr >> vi_dev->alloc_shift];
++	void *buffer = vi_dev->shmem + dma_addr;
++
++	memcpy(orig_addr, buffer, size);
++}
++
++static void
++vi_dma_sync_single_for_device(struct device *dev, dma_addr_t dma_addr,
++			      size_t size, enum dma_data_direction dir)
++{
++	struct pci_dev *pci_dev = to_pci_dev(dev);
++	struct virtio_ivshmem_device *vi_dev = pci_get_drvdata(pci_dev);
++	void *orig_addr = vi_dev->map_src_addr[dma_addr >> vi_dev->alloc_shift];
++	void *buffer = vi_dev->shmem + dma_addr;
++
++	memcpy(buffer, orig_addr, size);
++}
++
++static const struct dma_map_ops virtio_ivshmem_dma_ops = {
++	.alloc = vi_dma_alloc,
++	.free = vi_dma_free,
++	.map_page = vi_dma_map_page,
++	.unmap_page = vi_dma_unmap_page,
++	.sync_single_for_cpu = vi_dma_sync_single_for_cpu,
++	.sync_single_for_device = vi_dma_sync_single_for_device,
++};
++
++static int virtio_ivshmem_probe(struct pci_dev *pci_dev,
++				const struct pci_device_id *pci_id)
++{
++	unsigned int chunks, chunk_size, bitmap_size;
++	struct virtio_ivshmem_device *vi_dev;
++	resource_size_t section_sz;
++	phys_addr_t section_addr;
++	unsigned int cap_pos;
++	u32 *state_table;
++	int vendor_cap;
++	u32 id, dword;
++	int ret;
++
++	vi_dev = devm_kzalloc(&pci_dev->dev, sizeof(*vi_dev), GFP_KERNEL);
++	if (!vi_dev)
++		return -ENOMEM;
++
++	pci_set_drvdata(pci_dev, vi_dev);
++	vi_dev->vdev.dev.parent = &pci_dev->dev;
++	vi_dev->vdev.dev.release = virtio_ivshmem_release_dev;
++	vi_dev->vdev.config = &virtio_ivshmem_config_ops;
++	vi_dev->vdev.id.device = pci_dev->class & IVSHM_PROTO_VIRTIO_DEVID_MASK;
++	vi_dev->vdev.id.vendor = pci_dev->subsystem_vendor;
++	vi_dev->pci_dev = pci_dev;
++
++	spin_lock_init(&vi_dev->virtqueues_lock);
++	INIT_LIST_HEAD(&vi_dev->virtqueues);
++
++	ret = pcim_enable_device(pci_dev);
++	if (ret)
++		return ret;
++
++	ret = pcim_iomap_regions(pci_dev, BIT(0), DRV_NAME);
++	if (ret)
++		return ret;
++
++	vi_dev->ivshm_regs = pcim_iomap_table(pci_dev)[0];
++
++	id = readl(&vi_dev->ivshm_regs->id);
++	if (id > 1) {
++		dev_err(&pci_dev->dev, "invalid ID %d\n", id);
++		return -EINVAL;
++	}
++	if (readl(&vi_dev->ivshm_regs->max_peers) != 2) {
++		dev_err(&pci_dev->dev, "number of peers must be 2\n");
++		return -EINVAL;
++	}
++
++	vi_dev->peer_id = !id;
++
++	vendor_cap = pci_find_capability(pci_dev, PCI_CAP_ID_VNDR);
++	if (vendor_cap < 0) {
++		dev_err(&pci_dev->dev, "missing vendor capability\n");
++		return -EINVAL;
++	}
++
++	if (pci_resource_len(pci_dev, 2) > 0) {
++		section_addr = pci_resource_start(pci_dev, 2);
++	} else {
++		cap_pos = vendor_cap + IVSHM_CFG_ADDRESS;
++		section_addr = get_config_qword(pci_dev, cap_pos);
++	}
++
++	cap_pos = vendor_cap + IVSHM_CFG_STATE_TAB_SZ;
++	pci_read_config_dword(pci_dev, cap_pos, &dword);
++	section_sz = dword;
++
++	if (!devm_request_mem_region(&pci_dev->dev, section_addr, section_sz,
++				     DRV_NAME))
++		return -EBUSY;
++
++	state_table = devm_memremap(&pci_dev->dev, section_addr, section_sz,
++				    MEMREMAP_WB);
++	if (!state_table)
++		return -ENOMEM;
++
++	vi_dev->peer_state = &state_table[vi_dev->peer_id];
++	if (*vi_dev->peer_state != VIRTIO_STATE_READY) {
++		dev_err(&pci_dev->dev, "backend not ready\n");
++		return -ENODEV;
++	}
++
++	section_addr += section_sz;
++
++	cap_pos = vendor_cap + IVSHM_CFG_RW_SECTION_SZ;
++	section_sz = get_config_qword(pci_dev, cap_pos);
++	if (section_sz < 2 * PAGE_SIZE) {
++		dev_err(&pci_dev->dev, "R/W section too small\n");
++		return -EINVAL;
++	}
++
++	vi_dev->shmem_sz = section_sz;
++	vi_dev->shmem = devm_memremap(&pci_dev->dev, section_addr, section_sz,
++				      MEMREMAP_WB);
++	if (!vi_dev->shmem)
++		return -ENOMEM;
++
++	vi_dev->virtio_header = vi_dev->shmem;
++	if (vi_dev->virtio_header->revision < 1) {
++		dev_err(&pci_dev->dev, "invalid virtio-ivshmem revision\n");
++		return -EINVAL;
++	}
++
++	spin_lock_init(&vi_dev->alloc_lock);
++
++	chunk_size = vi_dev->shmem_sz / VIRTIO_IVSHMEM_PREFERRED_ALLOC_CHUNKS;
++	if (chunk_size < SMP_CACHE_BYTES)
++		chunk_size = SMP_CACHE_BYTES;
++	if (chunk_size > PAGE_SIZE)
++		chunk_size = PAGE_SIZE;
++	vi_dev->alloc_shift = get_custom_order(chunk_size, 0);
++
++	chunks = vi_dev->shmem_sz >> vi_dev->alloc_shift;
++	bitmap_size = BITS_TO_LONGS(chunks) * sizeof(long);
++	vi_dev->alloc_bitmap = devm_kzalloc(&pci_dev->dev,
++					    bitmap_size,
++					    GFP_KERNEL);
++	if (!vi_dev->alloc_bitmap)
++		return -ENOMEM;
++
++	/* mark the header chunks used */
++	bitmap_set(vi_dev->alloc_bitmap, 0,
++		   1 << get_custom_order(vi_dev->virtio_header->size,
++					 vi_dev->alloc_shift));
++
++	vi_dev->map_src_addr = devm_kzalloc(&pci_dev->dev,
++					    chunks * sizeof(void *),
++					    GFP_KERNEL);
++	if (!vi_dev->map_src_addr)
++		return -ENOMEM;
++
++	set_dma_ops(&pci_dev->dev, &virtio_ivshmem_dma_ops);
++
++	pci_set_master(pci_dev);
++	pci_write_config_byte(pci_dev, vendor_cap + IVSHM_CFG_PRIV_CNTL, 0);
++
++	writel(VIRTIO_STATE_READY, &vi_dev->ivshm_regs->state);
++
++	ret = register_virtio_device(&vi_dev->vdev);
++	if (ret) {
++		dev_err(&pci_dev->dev, "failed to register device\n");
++		writel(0, &vi_dev->ivshm_regs->state);
++		put_device(&vi_dev->vdev.dev);
++	}
++
++	return ret;
++}
++
++static void virtio_ivshmem_remove(struct pci_dev *pci_dev)
++{
++	struct virtio_ivshmem_device *vi_dev = pci_get_drvdata(pci_dev);
++
++	writel(0, &vi_dev->ivshm_regs->state);
++	writel(0, &vi_dev->ivshm_regs->int_control);
++
++	unregister_virtio_device(&vi_dev->vdev);
++}
++
++static const struct pci_device_id virtio_ivshmem_id_table[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_SIEMENS, PCI_DEVICE_ID_IVSHMEM),
++	  (PCI_CLASS_OTHERS << 16) | IVSHM_PROTO_VIRTIO_FRONT, 0xffff00 },
++	{ 0 }
++};
++
++MODULE_DEVICE_TABLE(pci, virtio_ivshmem_id_table);
++
++static struct pci_driver virtio_ivshmem_driver = {
++	.name		= DRV_NAME,
++	.id_table	= virtio_ivshmem_id_table,
++	.probe		= virtio_ivshmem_probe,
++	.remove		= virtio_ivshmem_remove,
++};
++
++module_pci_driver(virtio_ivshmem_driver);
++
++MODULE_AUTHOR("Jan Kiszka <jan.kiszka@siemens.com>");
++MODULE_DESCRIPTION("Driver for ivshmem-based virtio front-end devices");
++MODULE_LICENSE("GPL v2");
+diff --git a/include/linux/ivshmem.h b/include/linux/ivshmem.h
+new file mode 100644
+index 000000000000..bad8547f071b
+--- /dev/null
++++ b/include/linux/ivshmem.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_IVSHMEM_H
++#define _LINUX_IVSHMEM_H
++
++#include <linux/types.h>
++
++#define IVSHM_PROTO_UNDEFINED		0x0000
++#define IVSHM_PROTO_NET			0x0001
++#define IVSHM_PROTO_VIRTIO_FRONT	0x8000
++#define IVSHM_PROTO_VIRTIO_BACK		0xc000
++#define IVSHM_PROTO_VIRTIO_DEVID_MASK	0x7fff
++
++#define IVSHM_CFG_PRIV_CNTL		0x03
++# define IVSHM_PRIV_CNTL_ONESHOT_INT	BIT(0)
++#define IVSHM_CFG_STATE_TAB_SZ		0x04
++#define IVSHM_CFG_RW_SECTION_SZ		0x08
++#define IVSHM_CFG_OUTPUT_SECTION_SZ	0x10
++#define IVSHM_CFG_ADDRESS		0x18
++
++struct ivshm_regs {
++	u32 id;
++	u32 max_peers;
++	u32 int_control;
++	u32 doorbell;
++	u32 state;
++};
++
++#define IVSHM_INT_ENABLE		BIT(0)
++
++#endif /* _LINUX_IVSHMEM_H */
+diff --git a/include/linux/pci_ids.h b/include/linux/pci_ids.h
+index e388c8b1cbc2..0c7bac4d7dec 100644
+--- a/include/linux/pci_ids.h
++++ b/include/linux/pci_ids.h
+@@ -1514,10 +1514,11 @@
+ #define PCI_DEVICE_ID_VIA_VX855_IDE	0xC409
+ #define PCI_DEVICE_ID_VIA_ANON		0xFFFF
+ 
+ #define PCI_VENDOR_ID_SIEMENS           0x110A
+ #define PCI_DEVICE_ID_SIEMENS_DSCC4     0x2102
++#define PCI_DEVICE_ID_IVSHMEM		0x4106
+ 
+ #define PCI_VENDOR_ID_VORTEX		0x1119
+ #define PCI_DEVICE_ID_VORTEX_GDT60x0	0x0000
+ #define PCI_DEVICE_ID_VORTEX_GDT6000B	0x0001
+ #define PCI_DEVICE_ID_VORTEX_GDT6x10	0x0002
+diff --git a/include/linux/uio_driver.h b/include/linux/uio_driver.h
+index 18238dc8bfd3..67f905eb8c88 100644
+--- a/include/linux/uio_driver.h
++++ b/include/linux/uio_driver.h
+@@ -32,10 +32,11 @@ struct uio_map;
+  *			UIO_MEM_DMA_COHERENT only (@addr should be the
+  *			void * returned from the same dma_alloc_coherent call)
+  * @offs:               offset of device memory within the page
+  * @size:		size of IO (multiple of page size)
+  * @memtype:		type of memory addr points to
++ * @readonly:                true of region is read-only
+  * @internal_addr:	ioremap-ped version of addr, for driver internal use
+  * @dma_device:		device struct that was passed to dma_alloc_coherent,
+  *			used with UIO_MEM_DMA_COHERENT only
+  * @map:		for use by the UIO core only.
+  */
+@@ -44,10 +45,11 @@ struct uio_mem {
+ 	phys_addr_t		addr;
+ 	dma_addr_t		dma_addr;
+ 	unsigned long		offs;
+ 	resource_size_t		size;
+ 	int			memtype;
++	bool			readonly;
+ 	void __iomem		*internal_addr;
+ 	struct device		*dma_device;
+ 	struct uio_map		*map;
+ };
+ 
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index a0df1e2e155a..ceb09f1e58f7 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -315,11 +315,11 @@ static int vmap_range_noflush(unsigned long addr, unsigned long end,
+ int vmap_page_range(unsigned long addr, unsigned long end,
+ 		    phys_addr_t phys_addr, pgprot_t prot)
+ {
+ 	int err;
+ 
+-	err = vmap_range_noflush(addr, end, phys_addr, pgprot_nx(prot),
++	err = vmap_range_noflush(addr, end, phys_addr, prot,
+ 				 ioremap_max_page_shift);
+ 	flush_cache_vmap(addr, end);
+ 	if (!err)
+ 		err = kmsan_ioremap_page_range(addr, end, phys_addr, prot,
+ 					       ioremap_max_page_shift);
+@@ -343,10 +343,11 @@ int ioremap_page_range(unsigned long addr, unsigned long end,
+ 			  (long)area->addr + get_vm_area_size(area));
+ 		return -ERANGE;
+ 	}
+ 	return vmap_page_range(addr, end, phys_addr, prot);
+ }
++EXPORT_SYMBOL_GPL(ioremap_page_range);
+ 
+ static void vunmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 			     pgtbl_mod_mask *mask)
+ {
+ 	pte_t *pte;
+@@ -3145,10 +3146,11 @@ struct vm_struct *__get_vm_area_caller(unsigned long size, unsigned long flags,
+ 				       const void *caller)
+ {
+ 	return __get_vm_area_node(size, 1, PAGE_SHIFT, flags, start, end,
+ 				  NUMA_NO_NODE, GFP_KERNEL, caller);
+ }
++EXPORT_SYMBOL_GPL(__get_vm_area_caller);
+ 
+ /**
+  * get_vm_area - reserve a contiguous kernel virtual area
+  * @size:	 size of the area
+  * @flags:	 %VM_IOREMAP for I/O mappings or VM_ALLOC
+diff --git a/tools/virtio/.gitignore b/tools/virtio/.gitignore
+index 7e47b281c442..ca9c4359f9e9 100644
+--- a/tools/virtio/.gitignore
++++ b/tools/virtio/.gitignore
+@@ -2,5 +2,7 @@
+ *.d
+ virtio_test
+ vhost_net_test
+ vringh_test
+ virtio-trace/trace-agent
++virtio-ivshmem-block
++virtio-ivshmem-console
+diff --git a/tools/virtio/Makefile b/tools/virtio/Makefile
+index e25e99c1c3b7..5edea9dcb6b3 100644
+--- a/tools/virtio/Makefile
++++ b/tools/virtio/Makefile
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: GPL-2.0
+-all: test mod
++all: test mod virtio-ivshmem-block virtio-ivshmem-console
+ test: virtio_test vringh_test vhost_net_test
+ virtio_test: virtio_ring.o virtio_test.o
+ vringh_test: vringh_test.o vringh.o virtio_ring.o
+ vhost_net_test: virtio_ring.o vhost_net_test.o
++virtio-ivshmem-block: virtio-ivshmem-block.o
++virtio-ivshmem-console: virtio-ivshmem-console.o
+ 
+ try-run = $(shell set -e;		\
+ 	if ($(1)) >/dev/null 2>&1;	\
+ 	then echo "$(2)";		\
+ 	else echo "$(3)";		\
+@@ -50,7 +52,8 @@ oot-clean: OOT_BUILD+=clean
+ 
+ .PHONY: all test mod clean vhost oot oot-clean oot-build
+ clean:
+ 	${RM} *.o vringh_test virtio_test vhost_net_test vhost_test/*.o \
+               vhost_test/.*.cmd vhost_test/Module.symvers \
+-              vhost_test/modules.order *.d
++              vhost_test/modules.order *.d \
++              virtio-ivshmem-block virtio-ivshmem-console
+ -include *.d
+diff --git a/tools/virtio/virtio-ivshmem-block.c b/tools/virtio/virtio-ivshmem-block.c
+new file mode 100644
+index 000000000000..c97aa5076a6d
+--- /dev/null
++++ b/tools/virtio/virtio-ivshmem-block.c
+@@ -0,0 +1,357 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio block over uio_ivshmem back-end device
++ *
++ * Copyright (c) Siemens AG, 2019
++ */
++
++/*
++ * HACK warnings:
++ *  - little-endian hosts only
++ *  - no proper input validation (specifically addresses)
++ *  - may miss a couple of barriers
++ *  - ignores a couple of mandatory properties, e.g. notification control
++ *  - could implement some optional block features
++ *  - might eat your data
++ */
++
++#include <assert.h>
++#include <errno.h>
++#include <error.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++#include <linux/virtio_blk.h>
++#include <linux/virtio_ring.h>
++
++#ifndef VIRTIO_F_ORDER_PLATFORM
++#define VIRTIO_F_ORDER_PLATFORM		36
++#endif
++
++struct ivshm_regs {
++	uint32_t id;
++	uint32_t max_peers;
++	uint32_t int_control;
++	uint32_t doorbell;
++	uint32_t state;
++};
++
++#define VIRTIO_STATE_RESET		0
++#define VIRTIO_STATE_READY		1
++
++struct virtio_queue_config {
++	uint16_t size;
++	uint16_t device_vector;
++	uint16_t driver_vector;
++	uint16_t enable;
++	uint64_t desc;
++	uint64_t driver;
++	uint64_t device;
++};
++
++struct virtio_ivshmem_block {
++	uint32_t revision;
++	uint32_t size;
++
++	uint32_t write_transaction;
++
++	uint32_t device_features;
++	uint32_t device_features_sel;
++	uint32_t driver_features;
++	uint32_t driver_features_sel;
++
++	uint32_t queue_sel;
++	struct virtio_queue_config queue_config;
++
++	uint8_t config_event;
++	uint8_t queue_event;
++	uint8_t __reserved[2];
++	uint32_t device_status;
++
++	uint32_t config_generation;
++
++	struct virtio_blk_config config;
++};
++
++#define VI_REG_OFFSET(reg) \
++	__builtin_offsetof(struct virtio_ivshmem_block, reg)
++
++static struct ivshm_regs *regs;
++static int uio_fd, image_fd;
++static struct stat image_stat;
++static struct virtio_ivshmem_block *vb;
++static struct vring vring;
++static uint16_t next_idx;
++static void *shmem;
++static uint32_t peer_id;
++
++static inline uint32_t mmio_read32(void *address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void mmio_write32(void *address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void wait_for_interrupt(struct ivshm_regs *regs)
++{
++	uint32_t dummy;
++
++	if (read(uio_fd, &dummy, 4) < 0)
++		error(1, errno, "UIO read failed");
++	mmio_write32(&regs->int_control, 1);
++}
++
++static int process_queue(void)
++{
++	struct virtio_blk_outhdr *req;
++	struct vring_desc *desc;
++	int idx, used_idx, ret;
++	size_t size, len;
++	uint8_t status;
++
++	if (next_idx == vring.avail->idx)
++		return 0;
++
++	idx = vring.avail->ring[next_idx % vring.num];
++
++	desc = &vring.desc[idx];
++	assert(desc->len == sizeof(*req));
++	assert(desc->flags & 1);
++	req = shmem + desc->addr;
++
++	len = 1;
++
++	switch (req->type) {
++	case VIRTIO_BLK_T_IN:
++		desc = &vring.desc[desc->next];
++		assert(desc->flags & 1);
++		size = desc->len;
++		ret = pread(image_fd, shmem + desc->addr, size,
++			    req->sector * 512);
++		if (ret == size) {
++			status = VIRTIO_BLK_S_OK;
++			len += size;
++		} else {
++			status = VIRTIO_BLK_S_IOERR;
++		}
++		break;
++	case VIRTIO_BLK_T_OUT:
++		desc = &vring.desc[desc->next];
++		assert(desc->flags & 1);
++		size = desc->len;
++		ret = pwrite(image_fd, shmem + desc->addr, size,
++			     req->sector * 512);
++		status = ret == size ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
++		break;
++	case VIRTIO_BLK_T_FLUSH:
++		ret = fsync(image_fd);
++		status = ret == 0 ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
++		break;
++	case VIRTIO_BLK_T_GET_ID:
++		desc = &vring.desc[desc->next];
++		assert(desc->flags & 1);
++		len = desc->len > 0 ? 1 : 0;
++		memset(shmem + desc->addr, 0, len);
++		status = VIRTIO_BLK_S_OK;
++		break;
++	default:
++		printf("unknown request %d\n", req->type);
++		status = VIRTIO_BLK_S_UNSUPP;
++		break;
++	}
++
++	desc = &vring.desc[desc->next];
++	assert(!(desc->flags & 1));
++
++	*(uint8_t *)(shmem + desc->addr) = status;
++
++	used_idx = vring.used->idx % vring.num;
++	vring.used->ring[used_idx].id = idx;
++	vring.used->ring[used_idx].len = len;
++
++	__sync_synchronize();
++	vring.used->idx++;
++	next_idx++;
++
++	vb->queue_event = 1;
++	__sync_synchronize();
++	mmio_write32(&regs->doorbell,
++		     (peer_id << 16) | vb->queue_config.driver_vector);
++
++	return 1;
++}
++
++static int process_write_transaction(void)
++{
++	switch (vb->write_transaction) {
++	case 0:
++		return 0;
++	case VI_REG_OFFSET(device_features_sel):
++		printf("device_features_sel: %d\n", vb->device_features_sel);
++		if (vb->device_features_sel == 1) {
++			vb->device_features =
++				(1 << (VIRTIO_F_VERSION_1 - 32)) |
++				(1 << (VIRTIO_F_IOMMU_PLATFORM - 32)) |
++				(1 << (VIRTIO_F_ORDER_PLATFORM - 32));
++		} else {
++			vb->device_features =
++				(1 << VIRTIO_BLK_F_SIZE_MAX) |
++				(1 << VIRTIO_BLK_F_SEG_MAX) |
++				(1 << VIRTIO_BLK_F_FLUSH);
++		}
++		break;
++	case VI_REG_OFFSET(driver_features_sel):
++		printf("driver_features_sel: %d\n", vb->driver_features_sel);
++		break;
++	case VI_REG_OFFSET(driver_features):
++		printf("driver_features[%d]: 0x%x\n", vb->driver_features_sel,
++		       vb->driver_features);
++		break;
++	case VI_REG_OFFSET(queue_sel):
++		printf("queue_sel: %d\n", vb->queue_sel);
++		break;
++	case VI_REG_OFFSET(queue_config.size):
++		printf("queue size: %d\n", vb->queue_config.size);
++		break;
++	case VI_REG_OFFSET(queue_config.driver_vector):
++		printf("queue driver vector: %d\n",
++		       vb->queue_config.driver_vector);
++		break;
++	case VI_REG_OFFSET(queue_config.enable):
++		printf("queue enable: %d\n", vb->queue_config.enable);
++		if (vb->queue_config.enable) {
++			vring.num = vb->queue_config.size;
++			vring.desc = shmem + vb->queue_config.desc;
++			vring.avail = shmem + vb->queue_config.driver;
++			vring.used = shmem + vb->queue_config.device;
++			next_idx = 0;
++		}
++		break;
++	case VI_REG_OFFSET(queue_config.desc):
++		printf("queue desc: 0x%llx\n",
++		       (unsigned long long)vb->queue_config.desc);
++		break;
++	case VI_REG_OFFSET(queue_config.driver):
++		printf("queue driver: 0x%llx\n",
++		       (unsigned long long)vb->queue_config.driver);
++		break;
++	case VI_REG_OFFSET(queue_config.device):
++		printf("queue device: 0x%llx\n",
++		       (unsigned long long)vb->queue_config.device);
++		break;
++	case VI_REG_OFFSET(device_status):
++		printf("device_status: 0x%x\n", vb->device_status);
++		break;
++	default:
++		printf("unknown write transaction for %x\n",
++		       vb->write_transaction);
++		break;
++	}
++
++	__sync_synchronize();
++	vb->write_transaction = 0;
++
++	return 1;
++}
++
++int main(int argc, char *argv[])
++{
++	int pagesize = getpagesize();
++	unsigned long long shmem_sz;
++	volatile uint32_t *state;
++	int event, size_fd, ret;
++	char sysfs_path[64];
++	char size_str[64];
++	char *uio_devname;
++
++	if (argc < 3) {
++		fprintf(stderr, "usage: %s UIO-DEVICE IMAGE\n", argv[0]);
++		return 1;
++	}
++
++	image_fd = open(argv[2], O_RDWR);
++	if (image_fd < 0)
++		error(1, errno, "cannot open %s", argv[2]);
++
++	ret = fstat(image_fd, &image_stat);
++	if (ret < 0)
++		error(1, errno, "fstat failed");
++
++	uio_fd = open(argv[1], O_RDWR);
++	if (uio_fd < 0)
++		error(1, errno, "cannot open %s", argv[1]);
++
++	regs = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, uio_fd, 0);
++	if (!regs)
++		error(1, errno, "mmap of registers failed");
++	state = mmap(NULL, 4096, PROT_READ, MAP_SHARED, uio_fd, pagesize);
++	if (!state)
++		error(1, errno, "mmap of state table failed");
++
++	uio_devname = strstr(argv[1], "/uio");
++	snprintf(sysfs_path, sizeof(sysfs_path),
++		 "/sys/class/uio%s/maps/map2/size",
++		 uio_devname);
++	size_fd = open(sysfs_path, O_RDONLY);
++	if (size_fd < 0)
++		error(1, errno, "cannot open %s", sysfs_path);
++	if (read(size_fd, size_str, sizeof(size_str)) < 0)
++		error(1, errno, "read from %s failed", sysfs_path);
++	shmem_sz = strtoll(size_str, NULL, 16);
++
++	shmem = mmap(NULL, shmem_sz, PROT_READ | PROT_WRITE, MAP_SHARED,
++		     uio_fd, 2 * pagesize);
++	if (!shmem)
++		error(1, errno, "mmap of shared memory failed");
++
++	peer_id = !mmio_read32(&regs->id);
++
++	mmio_write32(&regs->int_control, 1);
++
++	while (1) {
++		mmio_write32(&regs->state, VIRTIO_STATE_RESET);
++		while (state[peer_id] != VIRTIO_STATE_RESET) {
++			printf("Waiting for peer to reset...\n");
++			wait_for_interrupt(regs);
++		}
++
++		vb = shmem;
++		memset(vb, 0, sizeof(*vb));
++		vb->revision = 1;
++		vb->size = sizeof(*vb);
++
++		memset(&vb->queue_config, 0, sizeof(vb->queue_config));
++		vb->queue_config.size = 8;
++		vb->queue_config.device_vector = 1;
++
++		vb->config.capacity = image_stat.st_size / 512;
++		vb->config.size_max = (shmem_sz / 8) & ~(pagesize - 1);
++		vb->config.seg_max = 1;
++
++		mmio_write32(&regs->state, VIRTIO_STATE_READY);
++		while (state[peer_id] != VIRTIO_STATE_READY) {
++			printf("Waiting for peer to be ready...\n");
++			wait_for_interrupt(regs);
++		}
++
++		printf("Starting virtio device\n");
++
++		while (state[peer_id] == VIRTIO_STATE_READY) {
++			event = process_write_transaction();
++
++			if (vb->device_status == 0xf)
++				event |= process_queue();
++
++			if (!event)
++				wait_for_interrupt(regs);
++		}
++	}
++}
+diff --git a/tools/virtio/virtio-ivshmem-console.c b/tools/virtio/virtio-ivshmem-console.c
+new file mode 100644
+index 000000000000..c79be22c6a7a
+--- /dev/null
++++ b/tools/virtio/virtio-ivshmem-console.c
+@@ -0,0 +1,397 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio console over uio_ivshmem back-end device
++ *
++ * Copyright (c) Siemens AG, 2019
++ */
++
++/*
++ * HACK warnings:
++ *  - little-endian hosts only
++ *  - no proper input validation (specifically addresses)
++ *  - may miss a couple of barriers
++ *  - ignores a couple of mandatory properties, e.g. notification control
++ *  - could implement some optional console features
++ */
++
++#include <errno.h>
++#include <error.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <termios.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <linux/virtio_console.h>
++#include <linux/virtio_ring.h>
++
++#ifndef VIRTIO_F_ORDER_PLATFORM
++#define VIRTIO_F_ORDER_PLATFORM		36
++#endif
++
++struct ivshm_regs {
++	uint32_t id;
++	uint32_t max_peers;
++	uint32_t int_control;
++	uint32_t doorbell;
++	uint32_t state;
++};
++
++#define VIRTIO_STATE_RESET		0
++#define VIRTIO_STATE_READY		1
++
++struct virtio_queue_config {
++	uint16_t size;
++	uint16_t device_vector;
++	uint16_t driver_vector;
++	uint16_t enable;
++	uint64_t desc;
++	uint64_t driver;
++	uint64_t device;
++};
++
++struct virtio_ivshmem_console {
++	uint32_t revision;
++	uint32_t size;
++
++	uint32_t write_transaction;
++
++	uint32_t device_features;
++	uint32_t device_features_sel;
++	uint32_t driver_features;
++	uint32_t driver_features_sel;
++
++	uint32_t queue_sel;
++	struct virtio_queue_config queue_config;
++
++	uint8_t config_event;
++	uint8_t queue_event;
++	uint8_t __reserved[2];
++	uint32_t device_status;
++
++	uint32_t config_generation;
++
++	struct virtio_console_config config;
++};
++
++#define VI_REG_OFFSET(reg) \
++	__builtin_offsetof(struct virtio_ivshmem_console, reg)
++
++static struct ivshm_regs *regs;
++static int uio_fd;
++static struct virtio_ivshmem_console *vc;
++static struct virtio_queue_config queue_config[2];
++static int current_queue;
++static struct vring vring[2];
++static uint16_t next_idx[2];
++static void *shmem;
++static struct termios orig_termios;
++static uint32_t peer_id;
++
++static inline uint32_t mmio_read32(void *address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void mmio_write32(void *address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void wait_for_interrupt(struct ivshm_regs *regs)
++{
++	uint32_t dummy;
++
++	if (read(uio_fd, &dummy, 4) < 0)
++		error(1, errno, "UIO read failed");
++	mmio_write32(&regs->int_control, 1);
++}
++
++static int process_rx_queue(void)
++{
++	struct vring_desc *desc;
++	int idx, used_idx, ret;
++
++	if (next_idx[0] == vring[0].avail->idx)
++		return 0;
++
++	idx = vring[0].avail->ring[next_idx[0] % vring[0].num];
++	desc = &vring[0].desc[idx];
++
++	ret = read(STDIN_FILENO, shmem + desc->addr, desc->len);
++	if (ret <= 0)
++		return 0;
++
++	used_idx = vring[0].used->idx % vring[0].num;
++	vring[0].used->ring[used_idx].id = idx;
++	vring[0].used->ring[used_idx].len = ret;
++	__sync_synchronize();
++	vring[0].used->idx++;
++	next_idx[0]++;
++
++	vc->queue_event = 1;
++	__sync_synchronize();
++	mmio_write32(&regs->doorbell,
++		     (peer_id << 16) | queue_config[0].driver_vector);
++
++	return 1;
++}
++
++static int process_tx_queue(void)
++{
++	ssize_t written, remaining, res;
++	struct vring_desc *desc;
++	int idx, used_idx;
++
++	if (next_idx[1] == vring[1].avail->idx)
++		return 0;
++
++	idx = vring[1].avail->ring[next_idx[1] % vring[1].num];
++	desc = &vring[1].desc[idx];
++
++	written = 0;
++	remaining = desc->len;
++	while (remaining > written) {
++		res = write(STDOUT_FILENO, shmem + desc->addr + written,
++			    remaining);
++		if (res > 0) {
++			written += res;
++			remaining -= res;
++		}
++	}
++
++	used_idx = vring[1].used->idx % vring[1].num;
++	vring[1].used->ring[used_idx].id = idx;
++	vring[1].used->ring[used_idx].len = 0;
++
++	__sync_synchronize();
++	vring[1].used->idx++;
++	next_idx[1]++;
++
++	return 1;
++}
++
++static int process_write_transaction(void)
++{
++	unsigned int new_queue;
++
++	switch (vc->write_transaction) {
++	case 0:
++		return 0;
++	case VI_REG_OFFSET(device_features_sel):
++		printf("device_features_sel: %d\n", vc->device_features_sel);
++		if (vc->device_features_sel == 1) {
++			vc->device_features =
++				(1 << (VIRTIO_F_VERSION_1 - 32)) |
++				(1 << (VIRTIO_F_IOMMU_PLATFORM - 32)) |
++				(1 << (VIRTIO_F_ORDER_PLATFORM - 32));
++		} else {
++			vc->device_features = 1 << VIRTIO_CONSOLE_F_SIZE;
++		}
++		break;
++	case VI_REG_OFFSET(driver_features_sel):
++		printf("driver_features_sel: %d\n", vc->driver_features_sel);
++		break;
++	case VI_REG_OFFSET(driver_features):
++		printf("driver_features[%d]: 0x%x\n", vc->driver_features_sel,
++		       vc->driver_features);
++		break;
++	case VI_REG_OFFSET(queue_sel):
++		new_queue = vc->queue_sel;
++		printf("queue_sel: %d\n", new_queue);
++		if (new_queue > 1)
++			break;
++
++		if (current_queue >= 0)
++			memcpy(&queue_config[current_queue], &vc->queue_config,
++			    sizeof(struct virtio_queue_config));
++
++		current_queue = new_queue;
++		memcpy(&vc->queue_config, &queue_config[current_queue],
++		       sizeof(struct virtio_queue_config));
++		break;
++	case VI_REG_OFFSET(queue_config.size):
++		printf("queue size: %d\n", vc->queue_config.size);
++		break;
++	case VI_REG_OFFSET(queue_config.driver_vector):
++		printf("queue driver vector: %d\n",
++		       vc->queue_config.driver_vector);
++		break;
++	case VI_REG_OFFSET(queue_config.enable):
++		printf("queue enable: %d\n", vc->queue_config.enable);
++		if (current_queue >= 0 && vc->queue_config.enable) {
++			memcpy(&queue_config[current_queue], &vc->queue_config,
++			    sizeof(struct virtio_queue_config));
++			vring[current_queue].num = vc->queue_config.size;
++			vring[current_queue].desc =
++				shmem + vc->queue_config.desc;
++			vring[current_queue].avail =
++				shmem + vc->queue_config.driver;
++			vring[current_queue].used =
++				shmem + vc->queue_config.device;
++			next_idx[current_queue] = 0;
++		}
++		break;
++	case VI_REG_OFFSET(queue_config.desc):
++		printf("queue desc: 0x%llx\n",
++		       (unsigned long long)vc->queue_config.desc);
++		break;
++	case VI_REG_OFFSET(queue_config.driver):
++		printf("queue driver: 0x%llx\n",
++		       (unsigned long long)vc->queue_config.driver);
++		break;
++	case VI_REG_OFFSET(queue_config.device):
++		printf("queue device: 0x%llx\n",
++		       (unsigned long long)vc->queue_config.device);
++		break;
++	case VI_REG_OFFSET(device_status):
++		printf("device_status: 0x%x\n", vc->device_status);
++		if (vc->device_status == 0xf) {
++			vc->config_event = 1;
++			__sync_synchronize();
++			mmio_write32(&regs->doorbell, peer_id << 16);
++		}
++		break;
++	default:
++		printf("unknown write transaction for %x\n",
++		       vc->write_transaction);
++		break;
++	}
++
++	__sync_synchronize();
++	vc->write_transaction = 0;
++
++	return 1;
++}
++
++static void restore_stdin(void)
++{
++	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
++}
++
++int main(int argc, char *argv[])
++{
++	int pagesize = getpagesize();
++	unsigned long long shmem_sz;
++	volatile uint32_t *state;
++	struct pollfd pollfd[2];
++	int event, size_fd, ret;
++	struct termios termios;
++	struct winsize winsize;
++	char sysfs_path[64];
++	char size_str[64];
++	char *uio_devname;
++
++	if (argc < 2) {
++		fprintf(stderr, "usage: %s UIO-DEVICE\n", argv[0]);
++		return 1;
++	}
++
++	pollfd[0].fd = STDIN_FILENO;
++	pollfd[0].events = POLLIN;
++
++	ret = fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
++	if (ret)
++		error(1, errno, "fcntl failed");
++
++	ret = tcgetattr(STDIN_FILENO, &orig_termios);
++	if (ret)
++		error(1, errno, "tcgetattr failed");
++	atexit(restore_stdin);
++	termios = orig_termios;
++	termios.c_iflag &= ~(ICRNL | IXON);
++	termios.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
++	ret = tcsetattr(STDIN_FILENO, TCSAFLUSH, &termios);
++	if (ret)
++		error(1, errno, "tcsetattr failed");
++
++	ret = ioctl(STDOUT_FILENO, TIOCGWINSZ, &winsize);
++	if (ret)
++		error(1, errno, "TIOCGWINSZ failed");
++
++	uio_fd = open(argv[1], O_RDWR);
++	if (uio_fd < 0)
++		error(1, errno, "cannot open %s", argv[1]);
++
++	pollfd[1].fd = uio_fd;
++	pollfd[1].events = POLLIN;
++
++	regs = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, uio_fd, 0);
++	if (!regs)
++		error(1, errno, "mmap of registers failed");
++	state = mmap(NULL, 4096, PROT_READ, MAP_SHARED, uio_fd, pagesize);
++	if (!state)
++		error(1, errno, "mmap of state table failed");
++
++	uio_devname = strstr(argv[1], "/uio");
++	snprintf(sysfs_path, sizeof(sysfs_path),
++		 "/sys/class/uio%s/maps/map2/size",
++		 uio_devname);
++	size_fd = open(sysfs_path, O_RDONLY);
++	if (size_fd < 0)
++		error(1, errno, "cannot open %s", sysfs_path);
++	if (read(size_fd, size_str, sizeof(size_str)) < 0)
++		error(1, errno, "read from %s failed", sysfs_path);
++	shmem_sz = strtoll(size_str, NULL, 16);
++
++	shmem = mmap(NULL, shmem_sz, PROT_READ | PROT_WRITE, MAP_SHARED,
++		     uio_fd, 2 * pagesize);
++	if (!shmem)
++		error(1, errno, "mmap of shared memory failed");
++
++	peer_id = !mmio_read32(&regs->id);
++
++	mmio_write32(&regs->int_control, 1);
++
++	while (1) {
++		mmio_write32(&regs->state, VIRTIO_STATE_RESET);
++		while (state[peer_id] != VIRTIO_STATE_RESET) {
++			printf("Waiting for peer to reset...\n");
++			wait_for_interrupt(regs);
++		}
++
++		vc = shmem;
++		memset(vc, 0, sizeof(*vc));
++		vc->revision = 1;
++		vc->size = sizeof(*vc);
++
++		memset(queue_config, 0, sizeof(queue_config));
++		queue_config[0].size = 8;
++		queue_config[0].device_vector = 1;
++		queue_config[1].size = 8;
++		queue_config[1].device_vector = 2;
++		current_queue = -1;
++
++		vc->config.cols = winsize.ws_col;
++		vc->config.rows = winsize.ws_row;
++
++		mmio_write32(&regs->state, VIRTIO_STATE_READY);
++		while (state[peer_id] != VIRTIO_STATE_READY) {
++			printf("Waiting for peer to be ready...\n");
++			wait_for_interrupt(regs);
++		}
++
++		printf("Starting virtio device\n");
++
++		while (state[peer_id] == VIRTIO_STATE_READY) {
++			event = process_write_transaction();
++
++			if (vc->device_status == 0xf) {
++				event |= process_rx_queue();
++				event |= process_tx_queue();
++			}
++
++			if (!event) {
++				ret = poll(pollfd, 2, -1);
++				if (ret < 0)
++					error(1, errno, "poll failed");
++				if (pollfd[1].revents & POLLIN)
++					wait_for_interrupt(regs);
++			}
++		}
++	}
++}
+-- 
+Created with Armbian build tools https://github.com/armbian/build
+

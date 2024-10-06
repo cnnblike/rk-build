@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Fri, 4 Oct 2024 11:12:09 +0800
+Subject: tweak around dts for rk3308 to enable uart3
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts | 15 +++++-----
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts b/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts
+index e2daae393d72..e7530aacbde2 100644
+--- a/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3308-rock-pi-s.dts
+@@ -30,17 +30,12 @@ chosen {
+ 	// 4 MB for inmate, then it should be 0x1f800000 - 0x400000 = 0x1f400000
+ 	reserved-memory {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+ 		ranges;
+-		jailhouse@5f800000 {
+-			reg = <0x0 0x1f800000 0x0 0x00800000>;
+-			no-map;
+-		};
+-
+-		jh_inmate@5f400000 {
+-			reg = <0x0 0x1f400000 0x0 0x00400000>;
++		jailhouse@5f400000 {
++			reg = <0x0 0x1f400000 0x0 0x00c00000>;
+ 			no-map;
+ 		};
+ 	};
+ 
+ 	leds {
+@@ -374,10 +369,16 @@ &uart0 {
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&uart0_xfer>;
+ 	status = "okay";
+ };
+ 
++&uart3 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&uart3_xfer>;
++	status = "okay";
++};
++
+ &uart4 {
+ 	uart-has-rtscts;
+ 	status = "okay";
+ 
+ 	bluetooth {
+-- 
+Created with Armbian build tools https://github.com/armbian/build
+
